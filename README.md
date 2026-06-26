@@ -27,13 +27,15 @@ cp .env.example .env
 ```env
 REDMINE_URL=https://redmine.example.com
 REDMINE_API_KEY=replace_with_your_api_key
-PROJECT_ID=your_project_id
+PROJECT_ID=forkers-v3-development
 USE_SAMPLE_DATA=false
 ```
 
 `REDMINE_URL` は自分のRedmine URL、`REDMINE_API_KEY` は自分のAPIキー、`PROJECT_ID` はRedmineのプロジェクト識別子に置き換えてください。
 
 ## 実行
+
+静的HTMLを1回生成する場合:
 
 ```bash
 python3 redmine_issues.py
@@ -46,6 +48,22 @@ kanban.html: /path/to/redmine-kanban-agent/kanban.html
 ```
 
 `kanban.html` は生成物です。GitHubには登録しません。
+
+ブラウザのF5キーでRedmineの最新状態へ追随したい場合は、ローカルサーバーモードを使います。
+
+```bash
+python3 redmine_issues.py --serve
+```
+
+ブラウザで開きます。
+
+```text
+http://127.0.0.1:8000/kanban.html
+```
+
+このURLをF5でリロードすると、Python側がRedmine APIからIssueを再取得してHTMLを返します。APIキーはブラウザには出さず、ローカルのPythonプロセス内だけで使います。終了するときはターミナルで `Ctrl+C` を押してください。
+
+画面上部の `PROJECT_ID` に別のプロジェクト識別子を入力して `表示` を押すと、そのPROJECT_IDで再取得します。初期値は `.env` の `PROJECT_ID` で、未設定の場合は `forkers-v3-development` です。
 
 ## サンプルデータモード
 
@@ -73,6 +91,7 @@ python3 redmine_issues.py
 - 担当者フィルタ
 - 対象バージョンの複数選択フィルタ
 - フィルタ解除ボタン
+- ライト / ダーク / OS設定連動のテーマ切替
 - フィルタ後のカラム件数更新
 - フィルタ後の担当者別作業負荷サマリー
 - 注意ラベルと夕会確認項目
@@ -91,6 +110,28 @@ python3 -m http.server 8000
 ```
 
 ブラウザで `http://localhost:8000/kanban.html` を開きます。
+
+ポート `8000` が使用中の場合は、別のポートを指定します。
+
+```bash
+python3 redmine_issues.py --serve --port 8001
+```
+
+ブラウザで `http://127.0.0.1:8001/kanban.html` を開きます。
+
+## テーマ切替
+
+`kanban.html` 上部のテーマ選択で以下を切り替えられます。
+
+- `OS設定に合わせる`
+- `ライト`
+- `ダーク`
+
+選択したテーマはブラウザの `localStorage` に `redmine-kanban-theme` というキーで保存されます。次回 `kanban.html` を開いたときも同じテーマで表示されます。
+
+テーマ切替、担当者フィルタ、対象バージョンフィルタ、作業負荷サマリーはすべて `kanban.html` 内のCSSとJavaScriptだけで動作します。サーバーは不要です。
+
+ただし、Redmine本体の更新をF5だけで反映したい場合は `python3 redmine_issues.py --serve` のローカルサーバーモードを使ってください。静的な `kanban.html` を直接開いている場合、F5は既存ファイルを読み直すだけで、Redmine APIへの再取得は行いません。
 
 ## GitHub登録前の確認
 
@@ -191,4 +232,12 @@ USE_SAMPLE_DATA=true
 
 ```bash
 git check-ignore -v kanban.html
+```
+
+### `Address already in use` と表示される
+
+ローカルサーバーのポートが既に使われています。別のポートで起動してください。
+
+```bash
+python3 redmine_issues.py --serve --port 8001
 ```

@@ -5,18 +5,23 @@ import html
 import json
 import os
 import sys
+from argparse import ArgumentParser
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 
 PAGE_LIMIT = 100
 TIMEOUT_SECONDS = 30
 OUTPUT_HTML = "kanban.html"
+DEFAULT_SERVE_HOST = "127.0.0.1"
+DEFAULT_SERVE_PORT = 8000
+DEFAULT_PROJECT_ID = "forkers-v3-development"
 COMPLETED_STATUSES = {"終了", "完了", "キャンセル", "Closed", "Done", "Canceled"}
 COMPLETED_STATUS_KEYS = {"closed", "done", "canceled"}
 HIGH_PRIORITIES = {"高", "High", "Urgent", "Immediate"}
@@ -394,11 +399,35 @@ def render_version_filter(issues: list[dict[str, Any]]) -> str:
     </fieldset>"""
 
 
+def render_theme_filter() -> str:
+    return """
+    <label class="theme-filter">
+      <span>テーマ</span>
+      <select id="theme-selector">
+        <option value="system">OS設定に合わせる</option>
+        <option value="light">ライト</option>
+        <option value="dark">ダーク</option>
+      </select>
+    </label>"""
+
+
+def render_project_control(project_id: str) -> str:
+    return f"""
+        <form class="project-control" action="/{OUTPUT_HTML}" method="get">
+          <label>
+            <span>PROJECT_ID</span>
+            <input type="text" name="project_id" value="{escape_text(project_id)}">
+          </label>
+          <button type="submit">表示</button>
+        </form>"""
+
+
 def render_filter_controls(issues: list[dict[str, Any]]) -> str:
     return f"""
     <div class="filter-controls">
 {render_assignee_filter(issues)}
 {render_version_filter(issues)}
+{render_theme_filter()}
       <button type="button" id="reset-filters">フィルタ解除</button>
     </div>"""
 
@@ -500,7 +529,9 @@ def render_issue_card(issue: dict[str, Any], redmine_url: str) -> str:
         </article>"""
 
 
-def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
+def render_kanban_html(
+    issues: list[dict[str, Any]], redmine_url: str, project_id: str
+) -> str:
     grouped = group_issues_by_status(issues)
     columns = []
     filter_html = render_filter_controls(issues)
@@ -523,7 +554,7 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
 
     columns_html = "\n".join(columns)
     return f"""<!doctype html>
-<html lang="ja">
+<html lang="ja" data-theme="system">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -533,10 +564,129 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
       box-sizing: border-box;
     }}
 
+    :root {{
+      color-scheme: light;
+      --bg-color: #f3f4f6;
+      --text-color: #1f2937;
+      --header-bg: #f3f4f6;
+      --header-text: #111827;
+      --column-bg: #e5e7eb;
+      --column-header-bg: #e5e7eb;
+      --card-bg: #ffffff;
+      --card-border: #d1d5db;
+      --muted-text: #6b7280;
+      --body-muted-text: #4b5563;
+      --link-color: #0f766e;
+      --flag-bg: #fee2e2;
+      --flag-text: #7f1d1d;
+      --flag-border: #f87171;
+      --control-bg: #ffffff;
+      --control-border: #9ca3af;
+      --control-text: #111827;
+      --chip-bg: #f9fafb;
+      --chip-border: #e5e7eb;
+      --button-bg: #374151;
+      --button-hover-bg: #111827;
+      --button-text: #ffffff;
+      --shadow-color: rgba(15, 23, 42, 0.08);
+      --evening-bg: #fff7ed;
+      --evening-border: #fdba74;
+      --evening-text: #7c2d12;
+      --evening-heading: #9a3412;
+      --workload-high-bg: #fee2e2;
+      --workload-high-text: #7f1d1d;
+      --workload-high-border: #ef4444;
+      --workload-warning-bg: #fef3c7;
+      --workload-warning-text: #78350f;
+      --workload-warning-border: #f59e0b;
+      --workload-normal-bg: #dcfce7;
+      --workload-normal-text: #14532d;
+    }}
+
+    html[data-theme="dark"] {{
+      color-scheme: dark;
+      --bg-color: #0f172a;
+      --text-color: #e5e7eb;
+      --header-bg: #111827;
+      --header-text: #f9fafb;
+      --column-bg: #1f2937;
+      --column-header-bg: #243244;
+      --card-bg: #111827;
+      --card-border: #374151;
+      --muted-text: #9ca3af;
+      --body-muted-text: #cbd5e1;
+      --link-color: #5eead4;
+      --flag-bg: #7f1d1d;
+      --flag-text: #fee2e2;
+      --flag-border: #fca5a5;
+      --control-bg: #0f172a;
+      --control-border: #475569;
+      --control-text: #f9fafb;
+      --chip-bg: #1e293b;
+      --chip-border: #475569;
+      --button-bg: #0f766e;
+      --button-hover-bg: #14b8a6;
+      --button-text: #ffffff;
+      --shadow-color: rgba(0, 0, 0, 0.35);
+      --evening-bg: #431407;
+      --evening-border: #ea580c;
+      --evening-text: #fed7aa;
+      --evening-heading: #fdba74;
+      --workload-high-bg: #7f1d1d;
+      --workload-high-text: #fee2e2;
+      --workload-high-border: #f87171;
+      --workload-warning-bg: #713f12;
+      --workload-warning-text: #fef3c7;
+      --workload-warning-border: #fbbf24;
+      --workload-normal-bg: #14532d;
+      --workload-normal-text: #dcfce7;
+    }}
+
+    @media (prefers-color-scheme: dark) {{
+      html[data-theme="system"] {{
+        color-scheme: dark;
+        --bg-color: #0f172a;
+        --text-color: #e5e7eb;
+        --header-bg: #111827;
+        --header-text: #f9fafb;
+        --column-bg: #1f2937;
+        --column-header-bg: #243244;
+        --card-bg: #111827;
+        --card-border: #374151;
+        --muted-text: #9ca3af;
+        --body-muted-text: #cbd5e1;
+        --link-color: #5eead4;
+        --flag-bg: #7f1d1d;
+        --flag-text: #fee2e2;
+        --flag-border: #fca5a5;
+        --control-bg: #0f172a;
+        --control-border: #475569;
+        --control-text: #f9fafb;
+        --chip-bg: #1e293b;
+        --chip-border: #475569;
+        --button-bg: #0f766e;
+        --button-hover-bg: #14b8a6;
+        --button-text: #ffffff;
+        --shadow-color: rgba(0, 0, 0, 0.35);
+        --evening-bg: #431407;
+        --evening-border: #ea580c;
+        --evening-text: #fed7aa;
+        --evening-heading: #fdba74;
+        --workload-high-bg: #7f1d1d;
+        --workload-high-text: #fee2e2;
+        --workload-high-border: #f87171;
+        --workload-warning-bg: #713f12;
+        --workload-warning-text: #fef3c7;
+        --workload-warning-border: #fbbf24;
+        --workload-normal-bg: #14532d;
+        --workload-normal-text: #dcfce7;
+      }}
+    }}
+
     body {{
       margin: 0;
-      color: #1f2937;
-      background: #f3f4f6;
+      color: var(--text-color);
+      background: var(--bg-color);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }}
 
@@ -545,19 +695,20 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
       left: 0;
       z-index: 2;
       padding: 20px 24px 16px;
-      background: #f3f4f6;
-      border-bottom: 1px solid #d1d5db;
+      background: var(--header-bg);
+      border-bottom: 1px solid var(--card-border);
     }}
 
     .page-header h1 {{
       margin: 0 0 4px;
+      color: var(--header-text);
       font-size: 24px;
       font-weight: 700;
     }}
 
     .page-header p {{
       margin: 0;
-      color: #4b5563;
+      color: var(--body-muted-text);
       font-size: 14px;
     }}
 
@@ -571,26 +722,75 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
 
     .filter-controls {{
       display: grid;
-      grid-template-columns: minmax(180px, 220px) minmax(240px, 1fr) auto;
+      grid-template-columns: minmax(160px, 200px) minmax(240px, 1fr) minmax(160px, 200px) auto;
       align-items: end;
       gap: 12px;
     }}
 
-    .assignee-filter {{
+    .project-control {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: end;
+      gap: 8px;
+      max-width: 520px;
+      margin-top: 12px;
+    }}
+
+    .project-control label {{
       display: grid;
       gap: 4px;
-      color: #374151;
+      color: var(--body-muted-text);
       font-size: 12px;
       font-weight: 700;
     }}
 
-    .assignee-filter select {{
+    .project-control input {{
       width: 100%;
       min-height: 34px;
       padding: 6px 10px;
-      color: #111827;
-      background: #ffffff;
-      border: 1px solid #9ca3af;
+      color: var(--control-text);
+      background: var(--control-bg);
+      border: 1px solid var(--control-border);
+      border-radius: 8px;
+      font: inherit;
+      font-weight: 600;
+    }}
+
+    .project-control button {{
+      min-height: 34px;
+      padding: 7px 12px;
+      color: var(--button-text);
+      background: var(--button-bg);
+      border: 1px solid var(--button-bg);
+      border-radius: 8px;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 800;
+      cursor: pointer;
+      white-space: nowrap;
+    }}
+
+    .project-control button:hover {{
+      background: var(--button-hover-bg);
+    }}
+
+    .assignee-filter,
+    .theme-filter {{
+      display: grid;
+      gap: 4px;
+      color: var(--body-muted-text);
+      font-size: 12px;
+      font-weight: 700;
+    }}
+
+    .assignee-filter select,
+    .theme-filter select {{
+      width: 100%;
+      min-height: 34px;
+      padding: 6px 10px;
+      color: var(--control-text);
+      background: var(--control-bg);
+      border: 1px solid var(--control-border);
       border-radius: 8px;
       font: inherit;
       font-weight: 600;
@@ -608,7 +808,7 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
     .version-filter legend {{
       margin: 0 0 4px;
       padding: 0;
-      color: #374151;
+      color: var(--body-muted-text);
       font-size: 12px;
       font-weight: 700;
     }}
@@ -620,8 +820,8 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
       max-height: 78px;
       overflow-y: auto;
       padding: 6px;
-      background: #ffffff;
-      border: 1px solid #d1d5db;
+      background: var(--control-bg);
+      border: 1px solid var(--card-border);
       border-radius: 8px;
     }}
 
@@ -631,9 +831,9 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
       gap: 5px;
       min-height: 24px;
       padding: 3px 7px;
-      color: #374151;
-      background: #f9fafb;
-      border: 1px solid #e5e7eb;
+      color: var(--text-color);
+      background: var(--chip-bg);
+      border: 1px solid var(--chip-border);
       border-radius: 999px;
       font-size: 12px;
       font-weight: 700;
@@ -647,9 +847,9 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
     #reset-filters {{
       min-height: 34px;
       padding: 7px 12px;
-      color: #ffffff;
-      background: #374151;
-      border: 1px solid #374151;
+      color: var(--button-text);
+      background: var(--button-bg);
+      border: 1px solid var(--button-bg);
       border-radius: 8px;
       font: inherit;
       font-size: 12px;
@@ -659,7 +859,7 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
     }}
 
     #reset-filters:hover {{
-      background: #111827;
+      background: var(--button-hover-bg);
     }}
 
     .workload-summary {{
@@ -668,7 +868,7 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
 
     .workload-summary h1 {{
       margin: 0 0 8px;
-      color: #374151;
+      color: var(--body-muted-text);
       font-size: 14px;
       font-weight: 800;
     }}
@@ -683,9 +883,9 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
     .workload-empty {{
       margin: 0;
       padding: 10px 12px;
-      color: #6b7280;
-      background: #ffffff;
-      border: 1px solid #d1d5db;
+      color: var(--muted-text);
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
       border-radius: 8px;
       font-size: 13px;
       font-weight: 700;
@@ -694,8 +894,8 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
     .workload-card {{
       flex: 0 0 220px;
       padding: 10px;
-      background: #ffffff;
-      border: 1px solid #d1d5db;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
       border-radius: 8px;
     }}
 
@@ -709,7 +909,7 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
 
     .workload-card h2 {{
       margin: 0;
-      color: #111827;
+      color: var(--header-text);
       font-size: 13px;
       line-height: 1.35;
       overflow-wrap: anywhere;
@@ -724,28 +924,28 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
     }}
 
     .workload-high {{
-      border-color: #ef4444;
-      box-shadow: inset 4px 0 0 #ef4444;
+      border-color: var(--workload-high-border);
+      box-shadow: inset 4px 0 0 var(--workload-high-border);
     }}
 
     .workload-high span {{
-      color: #7f1d1d;
-      background: #fee2e2;
+      color: var(--workload-high-text);
+      background: var(--workload-high-bg);
     }}
 
     .workload-warning {{
-      border-color: #f59e0b;
-      box-shadow: inset 4px 0 0 #f59e0b;
+      border-color: var(--workload-warning-border);
+      box-shadow: inset 4px 0 0 var(--workload-warning-border);
     }}
 
     .workload-warning span {{
-      color: #78350f;
-      background: #fef3c7;
+      color: var(--workload-warning-text);
+      background: var(--workload-warning-bg);
     }}
 
     .workload-normal span {{
-      color: #14532d;
-      background: #dcfce7;
+      color: var(--workload-normal-text);
+      background: var(--workload-normal-bg);
     }}
 
     .workload-card dl {{
@@ -761,14 +961,14 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
     }}
 
     .workload-card dt {{
-      color: #6b7280;
+      color: var(--muted-text);
       font-size: 11px;
       font-weight: 700;
     }}
 
     .workload-card dd {{
       margin: 0;
-      color: #111827;
+      color: var(--header-text);
       font-size: 16px;
       font-weight: 800;
     }}
@@ -779,6 +979,10 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
       }}
 
       .filter-controls {{
+        grid-template-columns: 1fr;
+      }}
+
+      .project-control {{
         grid-template-columns: 1fr;
       }}
     }}
@@ -795,8 +999,8 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
       flex: 0 0 340px;
       max-width: 340px;
       min-height: 160px;
-      background: #e5e7eb;
-      border: 1px solid #d1d5db;
+      background: var(--column-bg);
+      border: 1px solid var(--card-border);
       border-radius: 8px;
     }}
 
@@ -808,13 +1012,14 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
       justify-content: space-between;
       gap: 12px;
       padding: 12px 14px;
-      background: #e5e7eb;
-      border-bottom: 1px solid #d1d5db;
+      background: var(--column-header-bg);
+      border-bottom: 1px solid var(--card-border);
       border-radius: 8px 8px 0 0;
     }}
 
     .column-header h1 {{
       margin: 0;
+      color: var(--header-text);
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -826,9 +1031,9 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
       min-width: 28px;
       padding: 3px 8px;
       text-align: center;
-      color: #111827;
-      background: #ffffff;
-      border: 1px solid #d1d5db;
+      color: var(--header-text);
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
       border-radius: 999px;
       font-size: 12px;
       font-weight: 700;
@@ -842,10 +1047,10 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
 
     .issue-card {{
       padding: 12px;
-      background: #ffffff;
-      border: 1px solid #d1d5db;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
       border-radius: 8px;
-      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+      box-shadow: 0 1px 2px var(--shadow-color);
     }}
 
     .issue-card.is-hidden {{
@@ -855,7 +1060,7 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
     .issue-id {{
       display: inline-block;
       margin-bottom: 8px;
-      color: #0f766e;
+      color: var(--link-color);
       font-size: 13px;
       font-weight: 700;
       text-decoration: none;
@@ -877,9 +1082,9 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
       align-items: center;
       min-height: 22px;
       padding: 3px 8px;
-      color: #7f1d1d;
-      background: #fee2e2;
-      border: 1px solid #f87171;
+      color: var(--flag-text);
+      background: var(--flag-bg);
+      border: 1px solid var(--flag-border);
       border-radius: 999px;
       font-size: 11px;
       font-weight: 800;
@@ -888,7 +1093,7 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
 
     .issue-card h2 {{
       margin: 0 0 12px;
-      color: #111827;
+      color: var(--header-text);
       font-size: 14px;
       line-height: 1.45;
       overflow-wrap: anywhere;
@@ -909,27 +1114,27 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
     }}
 
     .meta-row dt {{
-      color: #6b7280;
+      color: var(--muted-text);
       font-weight: 600;
     }}
 
     .meta-row dd {{
       margin: 0;
-      color: #374151;
+      color: var(--text-color);
       overflow-wrap: anywhere;
     }}
 
     .evening-check {{
       margin-top: 12px;
       padding: 10px;
-      background: #fff7ed;
-      border: 1px solid #fdba74;
+      background: var(--evening-bg);
+      border: 1px solid var(--evening-border);
       border-radius: 8px;
     }}
 
     .evening-check h3 {{
       margin: 0 0 6px;
-      color: #9a3412;
+      color: var(--evening-heading);
       font-size: 12px;
       font-weight: 800;
     }}
@@ -939,7 +1144,7 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
       gap: 5px;
       margin: 0;
       padding-left: 18px;
-      color: #7c2d12;
+      color: var(--evening-text);
       font-size: 12px;
       line-height: 1.45;
     }}
@@ -955,6 +1160,7 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
       <div>
         <h1>Redmine Kanban</h1>
         <p><span id="visible-issue-count">{len(issues)}</span> / {len(issues)} issues</p>
+{render_project_control(project_id)}
       </div>
 {filter_html}
     </div>
@@ -964,12 +1170,40 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
 {columns_html}
   </main>
   <script>
+    const THEME_STORAGE_KEY = "redmine-kanban-theme";
+    const themeSelector = document.getElementById("theme-selector");
     const assigneeFilter = document.getElementById("assignee-filter");
     const versionAll = document.getElementById("version-all");
     const versionCheckboxes = Array.from(document.querySelectorAll(".version-checkbox"));
     const resetFiltersButton = document.getElementById("reset-filters");
     const visibleIssueCount = document.getElementById("visible-issue-count");
     const workloadGrid = document.getElementById("workload-grid");
+
+    function getSavedTheme() {{
+      const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+      if (["light", "dark", "system"].includes(savedTheme)) {{
+        return savedTheme;
+      }}
+      return "system";
+    }}
+
+    function applyTheme(theme) {{
+      const nextTheme = ["light", "dark", "system"].includes(theme) ? theme : "system";
+      document.documentElement.dataset.theme = nextTheme;
+      themeSelector.value = nextTheme;
+    }}
+
+    function saveTheme(theme) {{
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
+    }}
+
+    function initializeThemeSelector() {{
+      applyTheme(getSavedTheme());
+      themeSelector.addEventListener("change", () => {{
+        applyTheme(themeSelector.value);
+        saveTheme(themeSelector.value);
+      }});
+    }}
 
     function getSelectedVersions() {{
       if (versionAll.checked) {{
@@ -1124,6 +1358,7 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
     versionAll.addEventListener("change", handleVersionAllChange);
     versionCheckboxes.forEach((checkbox) => checkbox.addEventListener("change", handleVersionCheckboxChange));
     resetFiltersButton.addEventListener("click", resetFilters);
+    initializeThemeSelector();
     applyFilters();
   </script>
 </body>
@@ -1131,10 +1366,34 @@ def render_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> str:
 """
 
 
-def write_kanban_html(issues: list[dict[str, Any]], redmine_url: str) -> Path:
+def write_kanban_html(
+    issues: list[dict[str, Any]], redmine_url: str, project_id: str
+) -> Path:
     output_path = Path(OUTPUT_HTML).resolve()
-    output_path.write_text(render_kanban_html(issues, redmine_url), encoding="utf-8")
+    output_path.write_text(
+        render_kanban_html(issues, redmine_url, project_id), encoding="utf-8"
+    )
     return output_path
+
+
+def load_issue_data(
+    project_id_override: str | None = None,
+) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]]]:
+    load_env()
+    project_id = (project_id_override or os.getenv("PROJECT_ID") or DEFAULT_PROJECT_ID).strip()
+    if not project_id:
+        project_id = DEFAULT_PROJECT_ID
+
+    if env_flag("USE_SAMPLE_DATA"):
+        redmine_url = os.getenv("REDMINE_URL", "https://redmine.example.com")
+        issues = sample_issues()
+    else:
+        redmine_url = require_env("REDMINE_URL")
+        api_key = require_env("REDMINE_API_KEY")
+        issues = fetch_issues(redmine_url, api_key, project_id)
+
+    visible_issues = displayable_issues(issues)
+    return redmine_url, project_id, issues, visible_issues
 
 
 def alert_issues(
@@ -1166,20 +1425,136 @@ def print_alert_issues(issues: list[dict[str, Any]], redmine_url: str) -> None:
         print(f"URL: {issue_url(issue, redmine_url)}")
 
 
-def main() -> int:
-    try:
-        load_env()
-        if env_flag("USE_SAMPLE_DATA"):
-            redmine_url = os.getenv("REDMINE_URL", "https://redmine.example.com")
-            issues = sample_issues()
-        else:
-            redmine_url = require_env("REDMINE_URL")
-            api_key = require_env("REDMINE_API_KEY")
-            project_id = require_env("PROJECT_ID")
-            issues = fetch_issues(redmine_url, api_key, project_id)
+def render_error_html(message: str) -> str:
+    return f"""<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Redmine Kanban Error</title>
+  <style>
+    body {{
+      margin: 0;
+      padding: 32px;
+      color: #111827;
+      background: #f3f4f6;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
 
-        visible_issues = displayable_issues(issues)
-        output_path = write_kanban_html(visible_issues, redmine_url)
+    main {{
+      max-width: 760px;
+      padding: 20px;
+      background: #ffffff;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+    }}
+
+    h1 {{
+      margin: 0 0 12px;
+      font-size: 20px;
+    }}
+
+    p {{
+      margin: 0;
+      line-height: 1.6;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Redmine Kanban を更新できませんでした</h1>
+    <p>{escape_text(message)}</p>
+  </main>
+</body>
+</html>
+"""
+
+
+class KanbanRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        parsed_url = urlparse(self.path)
+        if parsed_url.path not in {"/", f"/{OUTPUT_HTML}"}:
+            self.send_error(404, "Not Found")
+            return
+
+        query = parse_qs(parsed_url.query)
+        project_id = query.get("project_id", [DEFAULT_PROJECT_ID])[0]
+
+        try:
+            redmine_url, resolved_project_id, _, visible_issues = load_issue_data(project_id)
+            response_body = render_kanban_html(
+                visible_issues, redmine_url, resolved_project_id
+            )
+            status_code = 200
+        except (ValueError, RuntimeError) as exc:
+            response_body = render_error_html(str(exc))
+            status_code = 500
+
+        encoded_body = response_body.encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded_body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(encoded_body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        print(f"[server] {self.address_string()} - {format % args}", file=sys.stderr)
+
+
+def serve_kanban(host: str, port: int) -> int:
+    try:
+        server = ThreadingHTTPServer((host, port), KanbanRequestHandler)
+    except OSError as exc:
+        print(
+            f"エラー: http://{host}:{port}/ は使用中、または起動できません。",
+            file=sys.stderr,
+        )
+        print(
+            "別のポートを指定してください。例: python3 redmine_issues.py --serve --port 8001",
+            file=sys.stderr,
+        )
+        print(f"詳細: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Redmine Kanban server: http://{host}:{port}/{OUTPUT_HTML}")
+    print("ブラウザでF5するとRedmine APIから再取得して表示します。終了は Ctrl+C です。")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nサーバーを終了しました。")
+    finally:
+        server.server_close()
+
+    return 0
+
+
+def parse_args() -> Any:
+    parser = ArgumentParser(description="Generate or serve a Redmine Kanban Board.")
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Start a local server. Browser reload fetches Redmine again.",
+    )
+    parser.add_argument("--host", default=DEFAULT_SERVE_HOST, help="Host for --serve.")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_SERVE_PORT,
+        help="Port for --serve.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.serve:
+        return serve_kanban(args.host, args.port)
+
+    try:
+        redmine_url, project_id, issues, visible_issues = load_issue_data()
+        output_path = write_kanban_html(visible_issues, redmine_url, project_id)
     except (ValueError, RuntimeError) as exc:
         print(f"エラー: {exc}", file=sys.stderr)
         return 1
