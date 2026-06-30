@@ -5,12 +5,13 @@ import html
 import json
 import os
 import sys
-from threading import RLock
 from argparse import ArgumentParser
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import RLock
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
@@ -23,6 +24,15 @@ OUTPUT_HTML = "kanban.html"
 DEFAULT_SERVE_HOST = "127.0.0.1"
 DEFAULT_SERVE_PORT = 8000
 DEFAULT_PROJECT_ID = "forkers-v3-development"
+STATUS_ORDER = [
+    "new",
+    "assigned",
+    "in progress",
+    "feedback",
+    "resolved",
+    "closed",
+    "canceled",
+]
 COMPLETED_STATUSES = {"終了", "完了", "キャンセル", "Closed", "Done", "Canceled"}
 COMPLETED_STATUS_KEYS = {"closed", "done", "canceled"}
 HIGH_PRIORITIES = {"高", "High", "Urgent", "Immediate"}
@@ -34,7 +44,16 @@ ALERT_QUESTIONS = OrderedDict(
         ("高優先度", "本日中に対応方針を決める必要はありますか？"),
     ]
 )
-ISSUE_CACHE: dict[str, tuple[str, list[dict[str, Any]]]] = {}
+
+
+@dataclass
+class IssueCacheEntry:
+    redmine_url: str
+    issues: list[dict[str, Any]]
+    refreshed_at: datetime
+
+
+ISSUE_CACHE: dict[str, IssueCacheEntry] = {}
 ISSUE_CACHE_LOCK = RLock()
 
 
@@ -231,7 +250,9 @@ def sample_issues() -> list[dict[str, Any]]:
     ]
 
 
-def fetch_issues(redmine_url: str, api_key: str, project_id: str) -> list[dict[str, Any]]:
+def fetch_issues(
+    redmine_url: str, api_key: str, project_id: str, updated_since: date | None = None
+) -> list[dict[str, Any]]:
     endpoint = urljoin(redmine_url.rstrip("/") + "/", "issues.json")
     issues: list[dict[str, Any]] = []
     offset = 0
@@ -244,6 +265,9 @@ def fetch_issues(redmine_url: str, api_key: str, project_id: str) -> list[dict[s
             "limit": PAGE_LIMIT,
             "offset": offset,
         }
+        if updated_since:
+            params["updated_on"] = f">={updated_since.isoformat()}"
+
         url = f"{endpoint}?{urlencode(params)}"
         request = Request(url, headers={"X-Redmine-API-Key": api_key})
 
@@ -307,7 +331,21 @@ def group_issues_by_status(
         status_name = issue_field(issue, "status", "ステータスなし")
         grouped.setdefault(status_name, []).append(issue)
 
-    return grouped
+    ordered_grouped: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+    for status_key in STATUS_ORDER:
+        for status_name, status_issues in grouped.items():
+            if status_order_key(status_name) == status_key:
+                ordered_grouped[status_name] = status_issues
+
+    for status_name, status_issues in grouped.items():
+        if status_name not in ordered_grouped:
+            ordered_grouped[status_name] = status_issues
+
+    return ordered_grouped
+
+
+def status_order_key(status_name: str) -> str:
+    return " ".join(status_name.lower().split())
 
 
 def assignee_names(issues: list[dict[str, Any]]) -> list[str]:
@@ -422,7 +460,8 @@ def render_project_control(project_id: str) -> str:
             <input type="text" name="project_id" value="{escape_text(project_id)}">
           </label>
           <button type="submit">表示</button>
-          <button type="submit" formmethod="post" formaction="/refresh">更新</button>
+          <button type="submit" name="refresh_mode" value="incremental" formmethod="post" formaction="/refresh">更新</button>
+          <button type="submit" name="refresh_mode" value="full" formmethod="post" formaction="/refresh">全更新</button>
         </form>"""
 
 
@@ -733,10 +772,10 @@ def render_kanban_html(
 
     .project-control {{
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-columns: minmax(0, 1fr) auto auto auto;
       align-items: end;
       gap: 8px;
-      max-width: 620px;
+      max-width: 720px;
       margin-top: 12px;
     }}
 
@@ -1387,6 +1426,7 @@ def resolve_project_id(project_id_override: str | None = None) -> str:
 
 def load_issue_data(
     project_id_override: str | None = None,
+    updated_since: date | None = None,
 ) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]]]:
     load_env()
     project_id = resolve_project_id(project_id_override)
@@ -1397,7 +1437,7 @@ def load_issue_data(
     else:
         redmine_url = require_env("REDMINE_URL")
         api_key = require_env("REDMINE_API_KEY")
-        issues = fetch_issues(redmine_url, api_key, project_id)
+        issues = fetch_issues(redmine_url, api_key, project_id, updated_since)
 
     visible_issues = displayable_issues(issues)
     return redmine_url, project_id, issues, visible_issues
@@ -1411,21 +1451,62 @@ def request_project_id(query: dict[str, list[str]]) -> str | None:
     return value or None
 
 
+def merge_issues(
+    current_issues: list[dict[str, Any]], updated_issues: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    updated_by_id = {issue.get("id"): issue for issue in updated_issues if issue.get("id")}
+    merged = []
+    seen_ids = set()
+
+    for issue in current_issues:
+        issue_id = issue.get("id")
+        if issue_id in updated_by_id:
+            merged.append(updated_by_id[issue_id])
+            seen_ids.add(issue_id)
+        else:
+            merged.append(issue)
+
+    for issue in updated_issues:
+        issue_id = issue.get("id")
+        if issue_id not in seen_ids:
+            merged.append(issue)
+            if issue_id:
+                seen_ids.add(issue_id)
+
+    return merged
+
+
 def load_cached_issue_data(
-    project_id_override: str | None = None, force_refresh: bool = False
+    project_id_override: str | None = None, refresh_mode: str | None = None
 ) -> tuple[str, str, list[dict[str, Any]]]:
     load_env()
     project_id = resolve_project_id(project_id_override)
 
     with ISSUE_CACHE_LOCK:
         cached = ISSUE_CACHE.get(project_id)
-        if cached and not force_refresh:
-            redmine_url, visible_issues = cached
-            return redmine_url, project_id, visible_issues
+        if cached and refresh_mode is None:
+            return cached.redmine_url, project_id, displayable_issues(cached.issues)
 
-    redmine_url, resolved_project_id, _, visible_issues = load_issue_data(project_id)
+        cached_issues = list(cached.issues) if cached else []
+        cached_refreshed_at = cached.refreshed_at if cached else None
+
+    updated_since = None
+    if refresh_mode == "incremental" and cached_refreshed_at:
+        updated_since = (cached_refreshed_at - timedelta(days=1)).date()
+
+    redmine_url, resolved_project_id, issues, visible_issues = load_issue_data(
+        project_id, updated_since
+    )
+    if updated_since:
+        issues = merge_issues(cached_issues, issues)
+        visible_issues = displayable_issues(issues)
+
     with ISSUE_CACHE_LOCK:
-        ISSUE_CACHE[resolved_project_id] = (redmine_url, visible_issues)
+        ISSUE_CACHE[resolved_project_id] = IssueCacheEntry(
+            redmine_url=redmine_url,
+            issues=issues,
+            refreshed_at=datetime.now(timezone.utc),
+        )
 
     return redmine_url, resolved_project_id, visible_issues
 
@@ -1542,10 +1623,13 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length).decode("utf-8")
         form = parse_qs(body)
         project_id = request_project_id(form)
+        refresh_mode = form.get("refresh_mode", ["incremental"])[0]
+        if refresh_mode not in {"incremental", "full"}:
+            refresh_mode = "incremental"
 
         try:
             _, resolved_project_id, _ = load_cached_issue_data(
-                project_id, force_refresh=True
+                project_id, refresh_mode=refresh_mode
             )
         except (ValueError, RuntimeError) as exc:
             response_body = render_error_html(str(exc))
@@ -1584,7 +1668,7 @@ def serve_kanban(host: str, port: int) -> int:
         return 1
 
     print(f"Redmine Kanban server: http://{host}:{port}/{OUTPUT_HTML}")
-    print("画面の更新ボタンを押すとRedmine APIから再取得します。終了は Ctrl+C です。")
+    print("画面の更新ボタンで差分取得、全更新ボタンで全件取得します。終了は Ctrl+C です。")
 
     try:
         server.serve_forever()

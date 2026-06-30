@@ -66,9 +66,9 @@ python3 redmine_issues.py --serve
 http://127.0.0.1:8000/kanban.html
 ```
 
-このURLを開くと、Python側がキャッシュしているIssueをHTMLとして返します。画面上部の `更新` を押したときだけRedmine APIからIssueを再取得します。APIキーはブラウザには出さず、ローカルのPythonプロセス内だけで使います。終了するときはターミナルで `Ctrl+C` を押してください。
+このURLを開くと、Python側がキャッシュしているIssueをHTMLとして返します。画面上部の `更新` を押したときだけ、前回取得日の1日前以降に変わったIssueをRedmine APIから差分取得してキャッシュに反映します。`全更新` を押すと全Issueを再取得します。APIキーはブラウザには出さず、ローカルのPythonプロセス内だけで使います。終了するときはターミナルで `Ctrl+C` を押してください。
 
-画面上部の `PROJECT_ID` に別のプロジェクト識別子を入力して `表示` を押すと、そのPROJECT_IDのキャッシュを表示します。未取得のPROJECT_IDでは初回だけRedmine APIから取得します。最新状態へ更新したい場合は `更新` を押してください。初期値は `.env` の `PROJECT_ID` で、未設定の場合は `forkers-v3-development` です。
+画面上部の `PROJECT_ID` に別のプロジェクト識別子を入力して `表示` を押すと、そのPROJECT_IDのキャッシュを表示します。未取得のPROJECT_IDでは初回だけRedmine APIから全件取得します。最新状態へ更新したい場合は `更新` を押してください。Issue削除や別プロジェクトへの移動まで反映したい場合は `全更新` を押してください。初期値は `.env` の `PROJECT_ID` で、未設定の場合は `forkers-v3-development` です。
 
 ## Dockerで実行
 
@@ -90,7 +90,7 @@ docker compose up --build
 http://127.0.0.1:8000/kanban.html
 ```
 
-画面上部の `更新` を押すと、コンテナ内のPythonプロセスがRedmine APIから再取得します。
+画面上部の `更新` を押すと、コンテナ内のPythonプロセスがRedmine APIから差分取得します。必要に応じて `全更新` で全Issueを再取得できます。
 
 ポート `8000` が使用中の場合は、`docker-compose.yml` の左側のポートを変更します。
 
