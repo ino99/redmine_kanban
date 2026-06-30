@@ -30,9 +30,13 @@ REDMINE_URL=https://redmine.example.com
 REDMINE_API_KEY=replace_with_your_api_key
 PROJECT_ID=forkers-v3-development
 USE_SAMPLE_DATA=false
+HTTP_PROXY=
+HTTPS_PROXY=
+NO_PROXY=localhost,127.0.0.1
 ```
 
 `REDMINE_URL` は自分のRedmine URL、`REDMINE_API_KEY` は自分のAPIキー、`PROJECT_ID` はRedmineのプロジェクト識別子に置き換えてください。
+Dockerコンテナ内からプロキシ経由でRedmineへアクセスする場合は、必要に応じて `HTTP_PROXY` と `HTTPS_PROXY` も設定してください。
 
 ## 実行
 
@@ -50,7 +54,7 @@ kanban.html: /path/to/redmine-kanban-agent/kanban.html
 
 `kanban.html` は生成物です。GitHubには登録しません。
 
-ブラウザのF5キーでRedmineの最新状態へ追随したい場合は、ローカルサーバーモードを使います。
+画面の `更新` ボタンでRedmineの最新状態へ追随したい場合は、ローカルサーバーモードを使います。
 
 ```bash
 python3 redmine_issues.py --serve
@@ -62,9 +66,9 @@ python3 redmine_issues.py --serve
 http://127.0.0.1:8000/kanban.html
 ```
 
-このURLをF5でリロードすると、Python側がRedmine APIからIssueを再取得してHTMLを返します。APIキーはブラウザには出さず、ローカルのPythonプロセス内だけで使います。終了するときはターミナルで `Ctrl+C` を押してください。
+このURLを開くと、Python側がキャッシュしているIssueをHTMLとして返します。画面上部の `更新` を押したときだけRedmine APIからIssueを再取得します。APIキーはブラウザには出さず、ローカルのPythonプロセス内だけで使います。終了するときはターミナルで `Ctrl+C` を押してください。
 
-画面上部の `PROJECT_ID` に別のプロジェクト識別子を入力して `表示` を押すと、そのPROJECT_IDで再取得します。初期値は `.env` の `PROJECT_ID` で、未設定の場合は `forkers-v3-development` です。
+画面上部の `PROJECT_ID` に別のプロジェクト識別子を入力して `表示` を押すと、そのPROJECT_IDのキャッシュを表示します。未取得のPROJECT_IDでは初回だけRedmine APIから取得します。最新状態へ更新したい場合は `更新` を押してください。初期値は `.env` の `PROJECT_ID` で、未設定の場合は `forkers-v3-development` です。
 
 ## Dockerで実行
 
@@ -86,7 +90,7 @@ docker compose up --build
 http://127.0.0.1:8000/kanban.html
 ```
 
-F5でリロードすると、コンテナ内のPythonプロセスがRedmine APIから再取得します。
+画面上部の `更新` を押すと、コンテナ内のPythonプロセスがRedmine APIから再取得します。
 
 ポート `8000` が使用中の場合は、`docker-compose.yml` の左側のポートを変更します。
 
@@ -172,7 +176,7 @@ python3 redmine_issues.py --serve --port 8001
 
 テーマ切替、担当者フィルタ、対象バージョンフィルタ、作業負荷サマリーはすべて `kanban.html` 内のCSSとJavaScriptだけで動作します。サーバーは不要です。
 
-ただし、Redmine本体の更新をF5だけで反映したい場合は `python3 redmine_issues.py --serve` のローカルサーバーモードを使ってください。静的な `kanban.html` を直接開いている場合、F5は既存ファイルを読み直すだけで、Redmine APIへの再取得は行いません。
+ただし、Redmine本体の更新を画面の `更新` ボタンで反映したい場合は `python3 redmine_issues.py --serve` のローカルサーバーモードを使ってください。静的な `kanban.html` を直接開いている場合、F5は既存ファイルを読み直すだけで、Redmine APIへの再取得は行いません。
 
 ## GitHub登録前の確認
 

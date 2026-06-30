@@ -5,6 +5,7 @@ import html
 import json
 import os
 import sys
+from threading import RLock
 from argparse import ArgumentParser
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
@@ -33,6 +34,8 @@ ALERT_QUESTIONS = OrderedDict(
         ("高優先度", "本日中に対応方針を決める必要はありますか？"),
     ]
 )
+ISSUE_CACHE: dict[str, tuple[str, list[dict[str, Any]]]] = {}
+ISSUE_CACHE_LOCK = RLock()
 
 
 def load_env(path: str = ".env") -> None:
@@ -419,6 +422,7 @@ def render_project_control(project_id: str) -> str:
             <input type="text" name="project_id" value="{escape_text(project_id)}">
           </label>
           <button type="submit">表示</button>
+          <button type="submit" formmethod="post" formaction="/refresh">更新</button>
         </form>"""
 
 
@@ -729,10 +733,10 @@ def render_kanban_html(
 
     .project-control {{
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: minmax(0, 1fr) auto auto;
       align-items: end;
       gap: 8px;
-      max-width: 520px;
+      max-width: 620px;
       margin-top: 12px;
     }}
 
@@ -1376,13 +1380,16 @@ def write_kanban_html(
     return output_path
 
 
+def resolve_project_id(project_id_override: str | None = None) -> str:
+    project_id = (project_id_override or os.getenv("PROJECT_ID") or DEFAULT_PROJECT_ID).strip()
+    return project_id or DEFAULT_PROJECT_ID
+
+
 def load_issue_data(
     project_id_override: str | None = None,
 ) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]]]:
     load_env()
-    project_id = (project_id_override or os.getenv("PROJECT_ID") or DEFAULT_PROJECT_ID).strip()
-    if not project_id:
-        project_id = DEFAULT_PROJECT_ID
+    project_id = resolve_project_id(project_id_override)
 
     if env_flag("USE_SAMPLE_DATA"):
         redmine_url = os.getenv("REDMINE_URL", "https://redmine.example.com")
@@ -1394,6 +1401,33 @@ def load_issue_data(
 
     visible_issues = displayable_issues(issues)
     return redmine_url, project_id, issues, visible_issues
+
+
+def request_project_id(query: dict[str, list[str]]) -> str | None:
+    value = query.get("project_id", [None])[0]
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def load_cached_issue_data(
+    project_id_override: str | None = None, force_refresh: bool = False
+) -> tuple[str, str, list[dict[str, Any]]]:
+    load_env()
+    project_id = resolve_project_id(project_id_override)
+
+    with ISSUE_CACHE_LOCK:
+        cached = ISSUE_CACHE.get(project_id)
+        if cached and not force_refresh:
+            redmine_url, visible_issues = cached
+            return redmine_url, project_id, visible_issues
+
+    redmine_url, resolved_project_id, _, visible_issues = load_issue_data(project_id)
+    with ISSUE_CACHE_LOCK:
+        ISSUE_CACHE[resolved_project_id] = (redmine_url, visible_issues)
+
+    return redmine_url, resolved_project_id, visible_issues
 
 
 def alert_issues(
@@ -1478,10 +1512,10 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             return
 
         query = parse_qs(parsed_url.query)
-        project_id = query.get("project_id", [DEFAULT_PROJECT_ID])[0]
+        project_id = request_project_id(query)
 
         try:
-            redmine_url, resolved_project_id, _, visible_issues = load_issue_data(project_id)
+            redmine_url, resolved_project_id, visible_issues = load_cached_issue_data(project_id)
             response_body = render_kanban_html(
                 visible_issues, redmine_url, resolved_project_id
             )
@@ -1497,6 +1531,38 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(encoded_body)
+
+    def do_POST(self) -> None:
+        parsed_url = urlparse(self.path)
+        if parsed_url.path != "/refresh":
+            self.send_error(404, "Not Found")
+            return
+
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(content_length).decode("utf-8")
+        form = parse_qs(body)
+        project_id = request_project_id(form)
+
+        try:
+            _, resolved_project_id, _ = load_cached_issue_data(
+                project_id, force_refresh=True
+            )
+        except (ValueError, RuntimeError) as exc:
+            response_body = render_error_html(str(exc))
+            encoded_body = response_body.encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded_body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(encoded_body)
+            return
+
+        location = f"/{OUTPUT_HTML}?{urlencode({'project_id': resolved_project_id})}"
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
 
     def log_message(self, format: str, *args: Any) -> None:
         print(f"[server] {self.address_string()} - {format % args}", file=sys.stderr)
@@ -1518,7 +1584,7 @@ def serve_kanban(host: str, port: int) -> int:
         return 1
 
     print(f"Redmine Kanban server: http://{host}:{port}/{OUTPUT_HTML}")
-    print("ブラウザでF5するとRedmine APIから再取得して表示します。終了は Ctrl+C です。")
+    print("画面の更新ボタンを押すとRedmine APIから再取得します。終了は Ctrl+C です。")
 
     try:
         server.serve_forever()
@@ -1535,7 +1601,7 @@ def parse_args() -> Any:
     parser.add_argument(
         "--serve",
         action="store_true",
-        help="Start a local server. Browser reload fetches Redmine again.",
+        help="Start a local server. The refresh button fetches Redmine again.",
     )
     parser.add_argument("--host", default=DEFAULT_SERVE_HOST, help="Host for --serve.")
     parser.add_argument(

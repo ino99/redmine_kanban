@@ -3,6 +3,13 @@ services:
     build: .
     env_file:
       - .env
+    environment:
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+      http_proxy: ${HTTP_PROXY:-}
+      https_proxy: ${HTTPS_PROXY:-}
+      no_proxy: ${NO_PROXY:-localhost,127.0.0.1}
     ports:
-      - "8000:8000"
+      - "8015:8000"
     command: ["python", "redmine_issues.py", "--serve", "--host", "0.0.0.0", "--port", "8000"]
