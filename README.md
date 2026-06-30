@@ -10,6 +10,7 @@ Redmine REST API からIssueを取得し、ブラウザで開ける `kanban.html
 - 誤ってAPIキーをコミットした場合は、履歴削除だけでなくAPIキーを再発行してください。
 - 可能であれば読み取り専用のAPIキーを使ってください。
 - GitHubにpushする前に必ず `git status` を確認してください。
+- `docker compose config` は `.env` の値を表示するため、出力を共有しないでください。
 
 ## セットアップ
 
@@ -64,6 +65,46 @@ http://127.0.0.1:8000/kanban.html
 このURLをF5でリロードすると、Python側がRedmine APIからIssueを再取得してHTMLを返します。APIキーはブラウザには出さず、ローカルのPythonプロセス内だけで使います。終了するときはターミナルで `Ctrl+C` を押してください。
 
 画面上部の `PROJECT_ID` に別のプロジェクト識別子を入力して `表示` を押すと、そのPROJECT_IDで再取得します。初期値は `.env` の `PROJECT_ID` で、未設定の場合は `forkers-v3-development` です。
+
+## Dockerで実行
+
+Docker内でローカルサーバーモードを起動できます。APIキーを含む `.env` はイメージにコピーせず、実行時に `env_file` として読み込みます。
+
+```bash
+cp .env.example .env
+```
+
+`.env` を編集したうえで起動します。
+
+```bash
+docker compose up --build
+```
+
+ブラウザで開きます。
+
+```text
+http://127.0.0.1:8000/kanban.html
+```
+
+F5でリロードすると、コンテナ内のPythonプロセスがRedmine APIから再取得します。
+
+ポート `8000` が使用中の場合は、`docker-compose.yml` の左側のポートを変更します。
+
+```yaml
+ports:
+  - "8001:8000"
+```
+
+この場合は `http://127.0.0.1:8001/kanban.html` を開きます。
+
+Docker Composeを使わずに起動する場合:
+
+```bash
+docker build -t redmine-kanban .
+docker run --rm --env-file .env -p 8000:8000 redmine-kanban
+```
+
+`.dockerignore` により `.env`, `kanban.html`, `__pycache__/` などはDockerビルドコンテキストから除外されます。
 
 ## サンプルデータモード
 

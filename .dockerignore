@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.git/
+.agents/
+.codex/
+__pycache__/
+.venv/
+venv/
+env/
+kanban.html
+output/
+logs/
+.DS_Store
+.vscode/
+.idea/
