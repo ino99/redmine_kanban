@@ -5,8 +5,10 @@ import html
 import json
 import os
 import sys
+import time
 from argparse import ArgumentParser
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +22,11 @@ from urllib.request import Request, urlopen
 
 PAGE_LIMIT = 100
 TIMEOUT_SECONDS = 30
+DEFAULT_FETCH_WORKERS = 4
+DEFAULT_FETCH_RETRIES = 3
+FETCH_RETRY_DELAY_SECONDS = 1.0
+TIME_ENTRY_PAGE_LIMIT = 100
+DEFAULT_TIME_ENTRY_PAGES = 2
 OUTPUT_HTML = "kanban.html"
 DEFAULT_SERVE_HOST = "127.0.0.1"
 DEFAULT_SERVE_PORT = 8000
@@ -127,12 +134,47 @@ def issue_url(issue: dict[str, Any], redmine_url: str) -> str:
     return urljoin(redmine_url.rstrip("/") + "/", f"issues/{issue.get('id', '-')}")
 
 
+def issue_numeric_id(issue: dict[str, Any]) -> int | None:
+    try:
+        return int(issue.get("id"))
+    except (TypeError, ValueError):
+        return None
+
+
 def assignee_name(issue: dict[str, Any]) -> str:
     return issue_field(issue, "assigned_to", "未設定")
 
 
 def fixed_version_name(issue: dict[str, Any]) -> str:
     return issue_field(issue, "fixed_version", "未設定")
+
+
+def remaining_work_time(issue: dict[str, Any]) -> str:
+    custom_fields = issue.get("custom_fields")
+    if not isinstance(custom_fields, list):
+        return "-"
+
+    for field in custom_fields:
+        if not isinstance(field, dict):
+            continue
+        if not str(field.get("name") or "").startswith("残作業時間"):
+            continue
+        value = field.get("value")
+        if isinstance(value, list):
+            value = ", ".join(str(item) for item in value if item)
+        if value not in (None, ""):
+            return str(value)
+
+    return "-"
+
+
+def format_remaining_work_time(value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned or cleaned == "-":
+        return "-"
+    if cleaned.endswith(("時間", "h", "H")):
+        return cleaned
+    return f"{cleaned}時間"
 
 
 def is_closed_or_canceled(issue: dict[str, Any]) -> bool:
@@ -203,6 +245,19 @@ def env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw_value = os.getenv(name)
+    if not raw_value:
+        return default
+
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default
+
+    return max(minimum, value)
+
+
 def sample_issues() -> list[dict[str, Any]]:
     return [
         {
@@ -213,6 +268,13 @@ def sample_issues() -> list[dict[str, Any]]:
             "assigned_to": {"name": "佐藤"},
             "priority": {"name": "High"},
             "fixed_version": {"name": "1.2.0"},
+            "custom_fields": [{"name": "残作業時間", "value": "3.5"}],
+            "_latest_time_entry": {
+                "spent_on": "2026-06-30",
+                "user": "佐藤",
+                "hours": "1.0h",
+                "comment": "文言案を確認中。レビュー後に反映予定。",
+            },
             "due_date": "2026-06-20",
             "updated_on": "2026-06-18T09:00:00Z",
         },
@@ -223,6 +285,7 @@ def sample_issues() -> list[dict[str, Any]]:
             "tracker": {"name": "Feature"},
             "priority": {"name": "normal"},
             "fixed_version": {"name": "1.3.0"},
+            "custom_fields": [{"name": "残作業時間", "value": ""}],
             "due_date": None,
             "updated_on": "2026-06-10T09:00:00Z",
         },
@@ -250,62 +313,222 @@ def sample_issues() -> list[dict[str, Any]]:
     ]
 
 
-def fetch_issues(
-    redmine_url: str, api_key: str, project_id: str, updated_since: date | None = None
-) -> list[dict[str, Any]]:
-    endpoint = urljoin(redmine_url.rstrip("/") + "/", "issues.json")
-    issues: list[dict[str, Any]] = []
-    offset = 0
-    total_count: int | None = None
+def fetch_issues_page(
+    endpoint: str,
+    api_key: str,
+    project_id: str,
+    offset: int,
+    updated_since: date | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    params = {
+        "project_id": project_id,
+        "status_id": "*",
+        "limit": PAGE_LIMIT,
+        "offset": offset,
+    }
+    if updated_since:
+        params["updated_on"] = f">={updated_since.isoformat()}"
 
-    while total_count is None or offset < total_count:
-        params = {
-            "project_id": project_id,
-            "status_id": "*",
-            "limit": PAGE_LIMIT,
-            "offset": offset,
-        }
-        if updated_since:
-            params["updated_on"] = f">={updated_since.isoformat()}"
+    url = f"{endpoint}?{urlencode(params)}"
+    request = Request(url, headers={"X-Redmine-API-Key": api_key})
+    retries = env_int("REDMINE_FETCH_RETRIES", DEFAULT_FETCH_RETRIES, minimum=0)
 
-        url = f"{endpoint}?{urlencode(params)}"
-        request = Request(url, headers={"X-Redmine-API-Key": api_key})
-
+    for attempt in range(retries + 1):
         try:
             with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
                 data = json.load(response)
+            break
         except HTTPError as exc:
             raise RuntimeError(
                 f"Redmine API がエラーを返しました。HTTP {exc.code}: {endpoint}"
             ) from exc
         except TimeoutError as exc:
+            if attempt < retries:
+                time.sleep(FETCH_RETRY_DELAY_SECONDS)
+                continue
             raise RuntimeError("Redmine API への接続がタイムアウトしました。") from exc
         except URLError as exc:
+            if attempt < retries:
+                time.sleep(FETCH_RETRY_DELAY_SECONDS)
+                continue
+            reason = getattr(exc, "reason", exc)
             raise RuntimeError(
-                "Redmine API に接続できませんでした。REDMINE_URL を確認してください。"
+                f"Redmine API に接続できませんでした。REDMINE_URL を確認してください。詳細: {reason}"
             ) from exc
         except json.JSONDecodeError as exc:
             raise RuntimeError("Redmine API のレスポンスをJSONとして読み取れませんでした。") from exc
 
-        if not isinstance(data, dict):
-            raise RuntimeError("Redmine API のレスポンス形式が不正です。")
+    if not isinstance(data, dict):
+        raise RuntimeError("Redmine API のレスポンス形式が不正です。")
 
-        page_issues = data.get("issues")
-        if not isinstance(page_issues, list):
-            raise RuntimeError("Redmine API のレスポンスに issues 配列がありません。")
+    page_issues = data.get("issues")
+    if not isinstance(page_issues, list):
+        raise RuntimeError("Redmine API のレスポンスに issues 配列がありません。")
 
-        issues.extend(page_issues)
-        try:
-            total_count = int(data.get("total_count", len(issues)))
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("Redmine API の total_count が数値ではありません。") from exc
+    try:
+        total_count = int(data.get("total_count", len(page_issues)))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Redmine API の total_count が数値ではありません。") from exc
 
-        if not page_issues:
-            break
+    return page_issues, total_count
 
-        offset += PAGE_LIMIT
+
+def fetch_issues(
+    redmine_url: str, api_key: str, project_id: str, updated_since: date | None = None
+) -> list[dict[str, Any]]:
+    endpoint = urljoin(redmine_url.rstrip("/") + "/", "issues.json")
+    first_page, total_count = fetch_issues_page(
+        endpoint, api_key, project_id, 0, updated_since
+    )
+    issues: list[dict[str, Any]] = list(first_page)
+
+    if not first_page or len(issues) >= total_count:
+        return issues
+
+    offsets = list(range(PAGE_LIMIT, total_count, PAGE_LIMIT))
+    worker_count = min(env_int("REDMINE_FETCH_WORKERS", DEFAULT_FETCH_WORKERS), len(offsets))
+    pages: dict[int, list[dict[str, Any]]] = {}
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_offset = {
+            executor.submit(fetch_issues_page, endpoint, api_key, project_id, offset, updated_since): offset
+            for offset in offsets
+        }
+        for future in as_completed(future_to_offset):
+            offset = future_to_offset[future]
+            page_issues, _ = future.result()
+            pages[offset] = page_issues
+
+    for offset in offsets:
+        issues.extend(pages.get(offset, []))
 
     return issues
+
+
+def fetch_time_entries_page(
+    endpoint: str,
+    api_key: str,
+    project_id: str,
+    offset: int,
+) -> list[dict[str, Any]]:
+    params = {
+        "project_id": project_id,
+        "limit": TIME_ENTRY_PAGE_LIMIT,
+        "offset": offset,
+        "sort": "spent_on:desc,created_on:desc",
+    }
+    url = f"{endpoint}?{urlencode(params)}"
+    request = Request(url, headers={"X-Redmine-API-Key": api_key})
+    retries = env_int("REDMINE_FETCH_RETRIES", DEFAULT_FETCH_RETRIES, minimum=0)
+
+    for attempt in range(retries + 1):
+        try:
+            with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+                data = json.load(response)
+            break
+        except HTTPError as exc:
+            raise RuntimeError(
+                f"Redmine 作業時間API がエラーを返しました。HTTP {exc.code}: {endpoint}"
+            ) from exc
+        except TimeoutError as exc:
+            if attempt < retries:
+                time.sleep(FETCH_RETRY_DELAY_SECONDS)
+                continue
+            raise RuntimeError("Redmine 作業時間API への接続がタイムアウトしました。") from exc
+        except URLError as exc:
+            if attempt < retries:
+                time.sleep(FETCH_RETRY_DELAY_SECONDS)
+                continue
+            reason = getattr(exc, "reason", exc)
+            raise RuntimeError(
+                f"Redmine 作業時間API に接続できませんでした。詳細: {reason}"
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Redmine 作業時間API のレスポンスをJSONとして読み取れませんでした。") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError("Redmine 作業時間API のレスポンス形式が不正です。")
+
+    entries = data.get("time_entries")
+    if not isinstance(entries, list):
+        raise RuntimeError("Redmine 作業時間API のレスポンスに time_entries 配列がありません。")
+
+    return entries
+
+
+def time_entry_user_name(entry: dict[str, Any]) -> str:
+    user = entry.get("user")
+    if isinstance(user, dict):
+        return str(user.get("name") or "-")
+    return "-"
+
+
+def format_time_entry_hours(entry: dict[str, Any]) -> str:
+    hours = entry.get("hours")
+    if hours in (None, ""):
+        return "-"
+    return f"{hours}h"
+
+
+def latest_time_entry_comments(
+    redmine_url: str,
+    api_key: str,
+    project_id: str,
+    issues: list[dict[str, Any]],
+) -> dict[int, dict[str, str]]:
+    issue_ids = {
+        issue_id for issue in issues if (issue_id := issue_numeric_id(issue)) is not None
+    }
+    if not issue_ids:
+        return {}
+
+    endpoint = urljoin(redmine_url.rstrip("/") + "/", "time_entries.json")
+    max_pages = env_int("REDMINE_TIME_ENTRY_PAGES", DEFAULT_TIME_ENTRY_PAGES, minimum=0)
+    comments: dict[int, dict[str, str]] = {}
+
+    for page in range(max_pages):
+        entries = fetch_time_entries_page(
+            endpoint,
+            api_key,
+            project_id,
+            page * TIME_ENTRY_PAGE_LIMIT,
+        )
+        if not entries:
+            break
+
+        for entry in entries:
+            issue = entry.get("issue")
+            if not isinstance(issue, dict):
+                continue
+            issue_id = issue.get("id")
+            if issue_id not in issue_ids or issue_id in comments:
+                continue
+            comment = str(entry.get("comments") or "").strip()
+            if comment:
+                comments[issue_id] = {
+                    "comment": comment,
+                    "spent_on": str(entry.get("spent_on") or "-"),
+                    "user": time_entry_user_name(entry),
+                    "hours": format_time_entry_hours(entry),
+                }
+
+        if comments.keys() >= issue_ids:
+            break
+
+    return comments
+
+
+def attach_time_entry_comments(
+    issues: list[dict[str, Any]],
+    comments: dict[int, dict[str, str]],
+) -> None:
+    for issue in issues:
+        issue_id = issue_numeric_id(issue)
+        if issue_id is None:
+            continue
+        comment = comments.get(issue_id)
+        if comment:
+            issue["_latest_time_entry"] = comment
 
 
 def print_issue_summary(issues: list[dict[str, Any]]) -> None:
@@ -475,6 +698,27 @@ def render_filter_controls(issues: list[dict[str, Any]]) -> str:
     </div>"""
 
 
+def workload_bar_width(value: int, max_value: int) -> int:
+    if value <= 0 or max_value <= 0:
+        return 0
+    return max(8, round(value / max_value * 100))
+
+
+def render_workload_metric(label: str, value: int, max_value: int, bar_class: str) -> str:
+    width = workload_bar_width(value, max_value)
+    value_class = " workload-bar-value-on-fill" if width >= 50 and bar_class in {"open", "overdue", "stale"} else ""
+    return f"""
+          <div class="workload-metric">
+            <dt>{escape_text(label)}</dt>
+            <dd>
+              <span class="workload-bar-shell">
+                <span class="workload-bar-fill workload-bar-{escape_text(bar_class)}" style="width: {width}%"></span>
+                <span class="workload-bar-value{value_class}">{value}</span>
+              </span>
+            </dd>
+          </div>"""
+
+
 def render_workload_summary(issues: list[dict[str, Any]]) -> str:
     workload = calculate_workload(issues)
     if not workload:
@@ -483,6 +727,13 @@ def render_workload_summary(issues: list[dict[str, Any]]) -> str:
     cards = []
     for item in workload:
         level_label, level_class = workload_level(item["open_count"])
+        max_value = max(
+            item["open_count"],
+            item["overdue_count"],
+            item["high_priority_count"],
+            item["stale_count"],
+            1,
+        )
         cards.append(
             f"""
       <article class="workload-card workload-{escape_text(level_class)}">
@@ -491,17 +742,19 @@ def render_workload_summary(issues: list[dict[str, Any]]) -> str:
           <span>{escape_text(level_label)}</span>
         </header>
         <dl>
-          <div><dt>未完了</dt><dd>{item["open_count"]}</dd></div>
-          <div><dt>期限超過</dt><dd>{item["overdue_count"]}</dd></div>
-          <div><dt>高優先度</dt><dd>{item["high_priority_count"]}</dd></div>
-          <div><dt>7日以上更新なし</dt><dd>{item["stale_count"]}</dd></div>
+{render_workload_metric("未完了", item["open_count"], max_value, "open")}
+{render_workload_metric("期限超過", item["overdue_count"], max_value, "overdue")}
+{render_workload_metric("高優先度", item["high_priority_count"], max_value, "priority")}
+{render_workload_metric("7日以上更新無", item["stale_count"], max_value, "stale")}
         </dl>
       </article>"""
         )
 
     return f"""
   <section class="workload-summary">
-    <h1>担当者別作業負荷</h1>
+    <div class="workload-summary-header">
+      <h1>担当者別作業負荷</h1>
+    </div>
     <div class="workload-grid" id="workload-grid">
 {''.join(cards)}
     </div>
@@ -543,6 +796,26 @@ def render_issue_card(issue: dict[str, Any], redmine_url: str) -> str:
         if question_items
         else ""
     )
+    latest_time_entry = issue.get("_latest_time_entry")
+    latest_time_entry_comment = ""
+    latest_time_entry_meta = ""
+    if isinstance(latest_time_entry, dict):
+        latest_time_entry_comment = str(latest_time_entry.get("comment") or "").strip()
+        latest_time_entry_meta = (
+            f'{latest_time_entry.get("spent_on") or "-"} / '
+            f'{latest_time_entry.get("user") or "-"} / '
+            f'{latest_time_entry.get("hours") or "-"}'
+        )
+    time_entry_comment_html = (
+        f"""
+          <section class="time-entry-comment">
+            <h3>最新作業時間コメント</h3>
+            <p class="time-entry-meta">{escape_text(latest_time_entry_meta)}</p>
+            <p>{escape_text(latest_time_entry_comment)}</p>
+          </section>"""
+        if latest_time_entry_comment
+        else ""
+    )
 
     fields = [
         ("トラッカー", issue_field(issue, "tracker")),
@@ -552,6 +825,9 @@ def render_issue_card(issue: dict[str, Any], redmine_url: str) -> str:
         ("期日", issue.get("due_date") or "-"),
         ("最終更新日", issue.get("updated_on") or "-"),
     ]
+    remaining_work = remaining_work_time(issue)
+    if remaining_work != "-":
+        fields.append(("残作業時間", format_remaining_work_time(remaining_work)))
     field_items = "\n".join(
         f"""
           <div class="meta-row">
@@ -569,6 +845,7 @@ def render_issue_card(issue: dict[str, Any], redmine_url: str) -> str:
           <dl class="meta-list">{field_items}
           </dl>
 {questions_html}
+{time_entry_comment_html}
         </article>"""
 
 
@@ -636,6 +913,10 @@ def render_kanban_html(
       --evening-border: #fdba74;
       --evening-text: #7c2d12;
       --evening-heading: #9a3412;
+      --note-bg: #ecfdf5;
+      --note-border: #86efac;
+      --note-text: #14532d;
+      --note-heading: #166534;
       --workload-high-bg: #fee2e2;
       --workload-high-text: #7f1d1d;
       --workload-high-border: #ef4444;
@@ -644,6 +925,14 @@ def render_kanban_html(
       --workload-warning-border: #f59e0b;
       --workload-normal-bg: #dcfce7;
       --workload-normal-text: #14532d;
+      --workload-total-bg: #a5f3fc;
+      --workload-total-border: #0284c7;
+      --workload-bar-track: #e5e7eb;
+      --workload-bar-open: #334155;
+      --workload-bar-overdue: #dc2626;
+      --workload-bar-priority: #d97706;
+      --workload-bar-stale: #7c3aed;
+      --workload-bar-value: #111827;
     }}
 
     html[data-theme="dark"] {{
@@ -675,6 +964,10 @@ def render_kanban_html(
       --evening-border: #ea580c;
       --evening-text: #fed7aa;
       --evening-heading: #fdba74;
+      --note-bg: #052e1a;
+      --note-border: #15803d;
+      --note-text: #bbf7d0;
+      --note-heading: #86efac;
       --workload-high-bg: #7f1d1d;
       --workload-high-text: #fee2e2;
       --workload-high-border: #f87171;
@@ -683,6 +976,14 @@ def render_kanban_html(
       --workload-warning-border: #fbbf24;
       --workload-normal-bg: #14532d;
       --workload-normal-text: #dcfce7;
+      --workload-total-bg: #164e63;
+      --workload-total-border: #22d3ee;
+      --workload-bar-track: #334155;
+      --workload-bar-open: #94a3b8;
+      --workload-bar-overdue: #f87171;
+      --workload-bar-priority: #fbbf24;
+      --workload-bar-stale: #a78bfa;
+      --workload-bar-value: #f8fafc;
     }}
 
     @media (prefers-color-scheme: dark) {{
@@ -715,6 +1016,10 @@ def render_kanban_html(
         --evening-border: #ea580c;
         --evening-text: #fed7aa;
         --evening-heading: #fdba74;
+        --note-bg: #052e1a;
+        --note-border: #15803d;
+        --note-text: #bbf7d0;
+        --note-heading: #86efac;
         --workload-high-bg: #7f1d1d;
         --workload-high-text: #fee2e2;
         --workload-high-border: #f87171;
@@ -723,6 +1028,14 @@ def render_kanban_html(
         --workload-warning-border: #fbbf24;
         --workload-normal-bg: #14532d;
         --workload-normal-text: #dcfce7;
+        --workload-total-bg: #164e63;
+        --workload-total-border: #22d3ee;
+        --workload-bar-track: #334155;
+        --workload-bar-open: #94a3b8;
+        --workload-bar-overdue: #f87171;
+        --workload-bar-priority: #fbbf24;
+        --workload-bar-stale: #a78bfa;
+        --workload-bar-value: #f8fafc;
       }}
     }}
 
@@ -909,8 +1222,17 @@ def render_kanban_html(
       margin-top: 4px;
     }}
 
-    .workload-summary h1 {{
+    .workload-summary-header {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      flex-wrap: wrap;
+      gap: 8px 14px;
       margin: 0 0 8px;
+    }}
+
+    .workload-summary h1 {{
+      margin: 0;
       color: var(--body-muted-text);
       font-size: 14px;
       font-weight: 800;
@@ -918,7 +1240,7 @@ def render_kanban_html(
 
     .workload-grid {{
       display: flex;
-      gap: 10px;
+      gap: 8px;
       overflow-x: auto;
       padding-bottom: 2px;
     }}
@@ -935,8 +1257,8 @@ def render_kanban_html(
     }}
 
     .workload-card {{
-      flex: 0 0 220px;
-      padding: 10px;
+      flex: 0 0 240px;
+      padding: 8px;
       background: var(--card-bg);
       border: 1px solid var(--card-border);
       border-radius: 8px;
@@ -947,18 +1269,18 @@ def render_kanban_html(
       align-items: start;
       justify-content: space-between;
       gap: 8px;
-      margin-bottom: 8px;
+      margin-bottom: 10px;
     }}
 
     .workload-card h2 {{
       margin: 0;
       color: var(--header-text);
       font-size: 13px;
-      line-height: 1.35;
+      line-height: 1.25;
       overflow-wrap: anywhere;
     }}
 
-    .workload-card span {{
+    .workload-card header > span {{
       flex: 0 0 auto;
       padding: 3px 7px;
       border-radius: 999px;
@@ -971,7 +1293,7 @@ def render_kanban_html(
       box-shadow: inset 4px 0 0 var(--workload-high-border);
     }}
 
-    .workload-high span {{
+    .workload-high header > span {{
       color: var(--workload-high-text);
       background: var(--workload-high-bg);
     }}
@@ -981,39 +1303,100 @@ def render_kanban_html(
       box-shadow: inset 4px 0 0 var(--workload-warning-border);
     }}
 
-    .workload-warning span {{
+    .workload-warning header > span {{
       color: var(--workload-warning-text);
       background: var(--workload-warning-bg);
     }}
 
-    .workload-normal span {{
+    .workload-normal header > span {{
       color: var(--workload-normal-text);
       background: var(--workload-normal-bg);
     }}
 
+    .workload-total {{
+      background: var(--workload-total-bg);
+      border-color: var(--workload-total-border);
+      box-shadow: inset 4px 0 0 var(--workload-total-border);
+    }}
+
     .workload-card dl {{
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 6px;
+      gap: 7px;
       margin: 0;
     }}
 
-    .workload-card dl div {{
+    .workload-metric {{
       display: grid;
-      gap: 2px;
+      grid-template-columns: 82px minmax(0, 1fr);
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
     }}
 
     .workload-card dt {{
       color: var(--muted-text);
       font-size: 11px;
       font-weight: 700;
+      line-height: 1.2;
+      text-align: left;
+      overflow-wrap: anywhere;
     }}
 
     .workload-card dd {{
       margin: 0;
-      color: var(--header-text);
-      font-size: 16px;
+    }}
+
+    .workload-bar-shell {{
+      position: relative;
+      display: block;
+      width: 100%;
+      height: 24px;
+      overflow: hidden;
+      background: var(--workload-bar-track);
+      border: 1px solid var(--card-border);
+      border-radius: 0;
+    }}
+
+    .workload-bar-fill {{
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      min-width: 0;
+      border-radius: 0;
+    }}
+
+    .workload-bar-open {{
+      background: var(--workload-bar-open);
+    }}
+
+    .workload-bar-overdue {{
+      background: var(--workload-bar-overdue);
+    }}
+
+    .workload-bar-priority {{
+      background: var(--workload-bar-priority);
+    }}
+
+    .workload-bar-stale {{
+      background: var(--workload-bar-stale);
+    }}
+
+    .workload-bar-value {{
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      z-index: 1;
+      transform: translate(-50%, -50%);
+      color: var(--workload-bar-value);
+      font-size: 14px;
       font-weight: 800;
+      line-height: 1;
+      text-shadow: 0 1px 2px var(--shadow-color);
+    }}
+
+    .workload-bar-value-on-fill {{
+      color: #ffffff;
     }}
 
     @media (max-width: 900px) {{
@@ -1195,6 +1578,37 @@ def render_kanban_html(
     .evening-check li {{
       overflow-wrap: anywhere;
     }}
+
+    .time-entry-comment {{
+      margin-top: 12px;
+      padding: 10px;
+      background: var(--note-bg);
+      border: 1px solid var(--note-border);
+      border-radius: 8px;
+    }}
+
+    .time-entry-comment h3 {{
+      margin: 0 0 6px;
+      color: var(--note-heading);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .time-entry-comment p {{
+      margin: 0;
+      color: var(--note-text);
+      font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }}
+
+    .time-entry-comment .time-entry-meta {{
+      margin-bottom: 6px;
+      color: var(--muted-text);
+      font-size: 11px;
+      font-weight: 700;
+    }}
   </style>
 </head>
 <body>
@@ -1266,12 +1680,38 @@ def render_kanban_html(
       return ["通常", "normal"];
     }}
 
-    function workloadMetric(label, value) {{
+    function workloadBarWidth(value, maxValue) {{
+      if (value <= 0 || maxValue <= 0) {{
+        return 0;
+      }}
+      return Math.max(8, Math.round(value / maxValue * 100));
+    }}
+
+    function shouldUseLightBarText(width, barClass) {{
+      return width >= 50 && ["open", "overdue", "stale"].includes(barClass);
+    }}
+
+    function workloadMetric(label, value, maxValue, barClass) {{
       const wrapper = document.createElement("div");
+      wrapper.className = "workload-metric";
+
       const term = document.createElement("dt");
       const description = document.createElement("dd");
+      const shell = document.createElement("span");
+      const fill = document.createElement("span");
+      const valueLabel = document.createElement("span");
+
       term.textContent = label;
-      description.textContent = value;
+      shell.className = "workload-bar-shell";
+      fill.className = `workload-bar-fill workload-bar-${{barClass}}`;
+      const width = workloadBarWidth(value, maxValue);
+      fill.style.width = `${{width}}%`;
+      valueLabel.className = "workload-bar-value";
+      valueLabel.classList.toggle("workload-bar-value-on-fill", shouldUseLightBarText(width, barClass));
+      valueLabel.textContent = value;
+
+      shell.append(fill, valueLabel);
+      description.append(shell);
       wrapper.append(term, description);
       return wrapper;
     }}
@@ -1280,20 +1720,33 @@ def render_kanban_html(
       const [levelLabel, levelClass] = workloadLevel(item.openCount);
       const card = document.createElement("article");
       card.className = `workload-card workload-${{levelClass}}`;
+      if (item.isTotal) {{
+        card.classList.add("workload-total");
+      }}
 
       const header = document.createElement("header");
       const title = document.createElement("h2");
       const badge = document.createElement("span");
       title.textContent = item.assignee;
       badge.textContent = levelLabel;
-      header.append(title, badge);
+      header.append(title);
+      if (!item.isTotal) {{
+        header.append(badge);
+      }}
 
+      const maxValue = Math.max(
+        item.openCount,
+        item.overdueCount,
+        item.highPriorityCount,
+        item.staleCount,
+        1,
+      );
       const details = document.createElement("dl");
       details.append(
-        workloadMetric("未完了", item.openCount),
-        workloadMetric("期限超過", item.overdueCount),
-        workloadMetric("高優先度", item.highPriorityCount),
-        workloadMetric("7日以上更新なし", item.staleCount),
+        workloadMetric("未完了", item.openCount, maxValue, "open"),
+        workloadMetric("期限超過", item.overdueCount, maxValue, "overdue"),
+        workloadMetric("高優先度", item.highPriorityCount, maxValue, "priority"),
+        workloadMetric("7日以上更新無", item.staleCount, maxValue, "stale"),
       );
 
       card.append(header, details);
@@ -1333,6 +1786,24 @@ def render_kanban_html(
         empty.textContent = "表示中の未完了Issueはありません。";
         workloadGrid.append(empty);
         return;
+      }}
+
+      if (assigneeFilter.value === "__all__") {{
+        const totalItem = items.reduce((total, item) => {{
+          total.openCount += item.openCount;
+          total.overdueCount += item.overdueCount;
+          total.highPriorityCount += item.highPriorityCount;
+          total.staleCount += item.staleCount;
+          return total;
+        }}, {{
+          assignee: "全体",
+          isTotal: true,
+          openCount: 0,
+          overdueCount: 0,
+          highPriorityCount: 0,
+          staleCount: 0,
+        }});
+        workloadGrid.append(createWorkloadCard(totalItem));
       }}
 
       items.forEach((item) => workloadGrid.append(createWorkloadCard(item)));
@@ -1440,6 +1911,17 @@ def load_issue_data(
         issues = fetch_issues(redmine_url, api_key, project_id, updated_since)
 
     visible_issues = displayable_issues(issues)
+    if not env_flag("USE_SAMPLE_DATA"):
+        try:
+            comments = latest_time_entry_comments(
+                redmine_url,
+                api_key,
+                project_id,
+                visible_issues,
+            )
+            attach_time_entry_comments(visible_issues, comments)
+        except RuntimeError as exc:
+            print(f"[server] 作業時間コメントを取得できませんでした: {exc}", file=sys.stderr)
     return redmine_url, project_id, issues, visible_issues
 
 

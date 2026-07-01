@@ -33,10 +33,14 @@ USE_SAMPLE_DATA=false
 HTTP_PROXY=
 HTTPS_PROXY=
 NO_PROXY=localhost,127.0.0.1
+REDMINE_FETCH_WORKERS=4
+REDMINE_FETCH_RETRIES=3
+REDMINE_TIME_ENTRY_PAGES=2
 ```
 
 `REDMINE_URL` は自分のRedmine URL、`REDMINE_API_KEY` は自分のAPIキー、`PROJECT_ID` はRedmineのプロジェクト識別子に置き換えてください。
 Dockerコンテナ内からプロキシ経由でRedmineへアクセスする場合は、必要に応じて `HTTP_PROXY` と `HTTPS_PROXY` も設定してください。
+`REDMINE_FETCH_WORKERS` はIssueページを並列取得する数です。`REDMINE_TIME_ENTRY_PAGES` は作業時間コメントを探すために `/time_entries.json` から取得するページ数です。重い場合は `1`、不要な場合は `0` にしてください。
 
 ## 実行
 
@@ -87,16 +91,15 @@ docker compose up --build
 ブラウザで開きます。
 
 ```text
-http://127.0.0.1:8000/kanban.html
+http://127.0.0.1:8015/kanban.html
 ```
 
 画面上部の `更新` を押すと、コンテナ内のPythonプロセスがRedmine APIから差分取得します。必要に応じて `全更新` で全Issueを再取得できます。
 
-ポート `8000` が使用中の場合は、`docker-compose.yml` の左側のポートを変更します。
+ポートを変更したい場合は、起動時に `KANBAN_PORT` を指定します。
 
-```yaml
-ports:
-  - "8001:8000"
+```bash
+KANBAN_PORT=8001 docker compose up --build
 ```
 
 この場合は `http://127.0.0.1:8001/kanban.html` を開きます。
@@ -139,6 +142,8 @@ python3 redmine_issues.py
 - ライト / ダーク / OS設定連動のテーマ切替
 - フィルタ後のカラム件数更新
 - フィルタ後の担当者別作業負荷サマリー
+- 担当者別作業負荷の棒グラフ表示
+- カスタムフィールド `残作業時間` と最新作業時間コメントの表示
 - 注意ラベルと夕会確認項目
 - closed / canceled / 終了 / 完了 / キャンセルで7日以上更新がないIssueの非表示
 
