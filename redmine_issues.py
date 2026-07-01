@@ -1039,16 +1039,23 @@ def render_kanban_html(
       }}
     }}
 
+    html,
     body {{
+      height: 100%;
+    }}
+
+    body {{
+      display: flex;
+      flex-direction: column;
       margin: 0;
+      overflow: hidden;
       color: var(--text-color);
       background: var(--bg-color);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }}
 
     .page-header {{
-      position: sticky;
-      left: 0;
+      flex: 0 0 auto;
       z-index: 2;
       padding: 20px 24px 16px;
       background: var(--header-bg);
@@ -1273,11 +1280,16 @@ def render_kanban_html(
     }}
 
     .workload-card h2 {{
+      min-width: 0;
+      max-width: 100%;
       margin: 0;
       color: var(--header-text);
       font-size: 13px;
       line-height: 1.25;
-      overflow-wrap: anywhere;
+      overflow-x: auto;
+      overflow-y: hidden;
+      white-space: nowrap;
+      scrollbar-width: thin;
     }}
 
     .workload-card header > span {{
@@ -1414,17 +1426,21 @@ def render_kanban_html(
     }}
 
     .kanban-board {{
+      flex: 1 1 auto;
       display: flex;
       gap: 16px;
-      min-height: calc(100vh - 82px);
-      overflow-x: auto;
+      min-height: 0;
+      overflow: auto;
       padding: 16px 24px 24px;
     }}
 
     .kanban-column {{
       flex: 0 0 340px;
       max-width: 340px;
+      align-self: flex-start;
       min-height: 160px;
+      max-height: 100%;
+      overflow-y: auto;
       background: var(--column-bg);
       border: 1px solid var(--card-border);
       border-radius: 8px;
@@ -2067,6 +2083,126 @@ def render_error_html(message: str) -> str:
 """
 
 
+def render_loading_html(project_id: str | None, refresh_mode: str = "full") -> str:
+    project_id_value = project_id or resolve_project_id(None)
+    form_body = urlencode({"project_id": project_id_value, "refresh_mode": refresh_mode})
+    form_body_json = json.dumps(form_body)
+    return f"""<!doctype html>
+<html lang="ja" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Redmine Kanban Loading</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg-color: #f3f4f6;
+      --text-color: #111827;
+      --muted-text: #6b7280;
+      --card-bg: #ffffff;
+      --card-border: #d1d5db;
+      --link-color: #0f766e;
+      --shadow-color: rgba(15, 23, 42, 0.08);
+    }}
+
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        color-scheme: dark;
+        --bg-color: #0f172a;
+        --text-color: #f9fafb;
+        --muted-text: #9ca3af;
+        --card-bg: #111827;
+        --card-border: #374151;
+        --link-color: #5eead4;
+        --shadow-color: rgba(0, 0, 0, 0.35);
+      }}
+    }}
+
+    body {{
+      display: grid;
+      min-height: 100vh;
+      margin: 0;
+      place-items: center;
+      color: var(--text-color);
+      background: var(--bg-color);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+
+    main {{
+      width: min(560px, calc(100vw - 32px));
+      padding: 22px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px var(--shadow-color);
+    }}
+
+    h1 {{
+      margin: 0 0 8px;
+      font-size: 20px;
+      line-height: 1.35;
+    }}
+
+    p {{
+      margin: 0;
+      color: var(--muted-text);
+      line-height: 1.6;
+    }}
+
+    .progress {{
+      height: 8px;
+      margin-top: 18px;
+      overflow: hidden;
+      background: var(--card-border);
+      border-radius: 999px;
+    }}
+
+    .progress span {{
+      display: block;
+      width: 42%;
+      height: 100%;
+      background: var(--link-color);
+      border-radius: inherit;
+      animation: loading 1.1s ease-in-out infinite;
+    }}
+
+    @keyframes loading {{
+      0% {{ transform: translateX(-110%); }}
+      100% {{ transform: translateX(260%); }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Redmine Kanban を読み込み中</h1>
+    <p>PROJECT_ID: {escape_text(project_id_value)}</p>
+    <p id="loading-message">Issueを取得しています。完了すると自動で表示します。</p>
+    <div class="progress" aria-hidden="true"><span></span></div>
+  </main>
+  <script>
+    fetch("/refresh", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+      body: {form_body_json},
+      cache: "no-store",
+      redirect: "follow",
+    }})
+      .then((response) => {{
+        if (!response.ok) {{
+          throw new Error(`HTTP ${{response.status}}`);
+        }}
+        window.location.replace(response.url || "/{OUTPUT_HTML}?project_id={escape_text(project_id_value)}");
+      }})
+      .catch((error) => {{
+        const message = document.getElementById("loading-message");
+        message.textContent = `Redmine Kanbanを更新できませんでした: ${{error.message}}`;
+      }});
+  </script>
+</body>
+</html>
+"""
+
+
 class KanbanRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed_url = urlparse(self.path)
@@ -2078,6 +2214,21 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
         project_id = request_project_id(query)
 
         try:
+            resolved_project_id = resolve_project_id(project_id)
+            with ISSUE_CACHE_LOCK:
+                has_cache = resolved_project_id in ISSUE_CACHE
+            if not has_cache:
+                response_body = render_loading_html(resolved_project_id)
+                status_code = 200
+                encoded_body = response_body.encode("utf-8")
+                self.send_response(status_code)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded_body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(encoded_body)
+                return
+
             redmine_url, resolved_project_id, visible_issues = load_cached_issue_data(project_id)
             response_body = render_kanban_html(
                 visible_issues, redmine_url, resolved_project_id
