@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Thread
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
@@ -21,9 +21,11 @@ from urllib.request import Request, urlopen
 
 
 PAGE_LIMIT = 100
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = 20
+DEFAULT_TIME_ENTRY_TIMEOUT_SECONDS = 8
 DEFAULT_FETCH_WORKERS = 4
-DEFAULT_FETCH_RETRIES = 3
+DEFAULT_FETCH_RETRIES = 0
+DEFAULT_TIME_ENTRY_RETRIES = 0
 FETCH_RETRY_DELAY_SECONDS = 1.0
 TIME_ENTRY_PAGE_LIMIT = 100
 DEFAULT_TIME_ENTRY_PAGES = 2
@@ -62,6 +64,8 @@ class IssueCacheEntry:
 
 ISSUE_CACHE: dict[str, IssueCacheEntry] = {}
 ISSUE_CACHE_LOCK = RLock()
+ISSUE_REFRESH_IN_PROGRESS: set[str] = set()
+ISSUE_REFRESH_ERRORS: dict[str, str] = {}
 
 
 def load_env(path: str = ".env") -> None:
@@ -419,11 +423,16 @@ def fetch_time_entries_page(
     }
     url = f"{endpoint}?{urlencode(params)}"
     request = Request(url, headers={"X-Redmine-API-Key": api_key})
-    retries = env_int("REDMINE_FETCH_RETRIES", DEFAULT_FETCH_RETRIES, minimum=0)
+    retries = env_int("REDMINE_TIME_ENTRY_RETRIES", DEFAULT_TIME_ENTRY_RETRIES, minimum=0)
+    timeout_seconds = env_int(
+        "REDMINE_TIME_ENTRY_TIMEOUT_SECONDS",
+        DEFAULT_TIME_ENTRY_TIMEOUT_SECONDS,
+        minimum=1,
+    )
 
     for attempt in range(retries + 1):
         try:
-            with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            with urlopen(request, timeout=timeout_seconds) as response:
                 data = json.load(response)
             break
         except HTTPError as exc:
@@ -434,7 +443,9 @@ def fetch_time_entries_page(
             if attempt < retries:
                 time.sleep(FETCH_RETRY_DELAY_SECONDS)
                 continue
-            raise RuntimeError("Redmine 作業時間API への接続がタイムアウトしました。") from exc
+            raise RuntimeError(
+                f"Redmine 作業時間API への接続が{timeout_seconds}秒でタイムアウトしました。"
+            ) from exc
         except URLError as exc:
             if attempt < retries:
                 time.sleep(FETCH_RETRY_DELAY_SECONDS)
@@ -1917,6 +1928,7 @@ def load_issue_data(
 ) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]]]:
     load_env()
     project_id = resolve_project_id(project_id_override)
+    started_at = time.monotonic()
 
     if env_flag("USE_SAMPLE_DATA"):
         redmine_url = os.getenv("REDMINE_URL", "https://redmine.example.com")
@@ -1924,11 +1936,27 @@ def load_issue_data(
     else:
         redmine_url = require_env("REDMINE_URL")
         api_key = require_env("REDMINE_API_KEY")
+        print(
+            f"[server] Issue取得を開始します。PROJECT_ID={project_id}",
+            file=sys.stderr,
+            flush=True,
+        )
         issues = fetch_issues(redmine_url, api_key, project_id, updated_since)
+        print(
+            f"[server] Issue取得完了: {len(issues)}件 ({time.monotonic() - started_at:.1f}秒)",
+            file=sys.stderr,
+            flush=True,
+        )
 
     visible_issues = displayable_issues(issues)
     if not env_flag("USE_SAMPLE_DATA"):
         try:
+            comment_started_at = time.monotonic()
+            print(
+                "[server] 作業時間コメント取得を開始します。",
+                file=sys.stderr,
+                flush=True,
+            )
             comments = latest_time_entry_comments(
                 redmine_url,
                 api_key,
@@ -1936,8 +1964,17 @@ def load_issue_data(
                 visible_issues,
             )
             attach_time_entry_comments(visible_issues, comments)
+            print(
+                f"[server] 作業時間コメント取得完了: {len(comments)}件 ({time.monotonic() - comment_started_at:.1f}秒)",
+                file=sys.stderr,
+                flush=True,
+            )
         except RuntimeError as exc:
-            print(f"[server] 作業時間コメントを取得できませんでした: {exc}", file=sys.stderr)
+            print(
+                f"[server] 作業時間コメントを取得できませんでした: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
     return redmine_url, project_id, issues, visible_issues
 
 
@@ -2007,6 +2044,31 @@ def load_cached_issue_data(
         )
 
     return redmine_url, resolved_project_id, visible_issues
+
+
+def start_background_refresh(project_id: str, refresh_mode: str = "full") -> None:
+    with ISSUE_CACHE_LOCK:
+        if project_id in ISSUE_CACHE or project_id in ISSUE_REFRESH_IN_PROGRESS:
+            return
+        ISSUE_REFRESH_IN_PROGRESS.add(project_id)
+        ISSUE_REFRESH_ERRORS.pop(project_id, None)
+
+    def refresh() -> None:
+        try:
+            load_cached_issue_data(project_id, refresh_mode=refresh_mode)
+        except (ValueError, RuntimeError) as exc:
+            with ISSUE_CACHE_LOCK:
+                ISSUE_REFRESH_ERRORS[project_id] = str(exc)
+            print(
+                f"[server] バックグラウンド取得に失敗しました: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            with ISSUE_CACHE_LOCK:
+                ISSUE_REFRESH_IN_PROGRESS.discard(project_id)
+
+    Thread(target=refresh, daemon=True).start()
 
 
 def alert_issues(
@@ -2083,10 +2145,10 @@ def render_error_html(message: str) -> str:
 """
 
 
-def render_loading_html(project_id: str | None, refresh_mode: str = "full") -> str:
+def render_loading_html(project_id: str | None) -> str:
     project_id_value = project_id or resolve_project_id(None)
-    form_body = urlencode({"project_id": project_id_value, "refresh_mode": refresh_mode})
-    form_body_json = json.dumps(form_body)
+    reload_url = f"/{OUTPUT_HTML}?{urlencode({'project_id': project_id_value})}"
+    reload_url_json = json.dumps(reload_url)
     return f"""<!doctype html>
 <html lang="ja" data-theme="system">
 <head>
@@ -2180,23 +2242,11 @@ def render_loading_html(project_id: str | None, refresh_mode: str = "full") -> s
     <div class="progress" aria-hidden="true"><span></span></div>
   </main>
   <script>
-    fetch("/refresh", {{
-      method: "POST",
-      headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
-      body: {form_body_json},
-      cache: "no-store",
-      redirect: "follow",
-    }})
-      .then((response) => {{
-        if (!response.ok) {{
-          throw new Error(`HTTP ${{response.status}}`);
-        }}
-        window.location.replace(response.url || "/{OUTPUT_HTML}?project_id={escape_text(project_id_value)}");
-      }})
-      .catch((error) => {{
-        const message = document.getElementById("loading-message");
-        message.textContent = `Redmine Kanbanを更新できませんでした: ${{error.message}}`;
-      }});
+    window.addEventListener("load", () => {{
+      window.setTimeout(() => {{
+        window.location.replace({reload_url_json});
+      }}, 5000);
+    }});
   </script>
 </body>
 </html>
@@ -2206,6 +2256,12 @@ def render_loading_html(project_id: str | None, refresh_mode: str = "full") -> s
 class KanbanRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed_url = urlparse(self.path)
+        if parsed_url.path == "/.well-known/appspecific/com.chrome.devtools.json":
+            self.send_response(204)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+
         if parsed_url.path not in {"/", f"/{OUTPUT_HTML}"}:
             self.send_error(404, "Not Found")
             return
@@ -2217,7 +2273,21 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             resolved_project_id = resolve_project_id(project_id)
             with ISSUE_CACHE_LOCK:
                 has_cache = resolved_project_id in ISSUE_CACHE
+                refresh_error = ISSUE_REFRESH_ERRORS.get(resolved_project_id)
             if not has_cache:
+                if refresh_error:
+                    response_body = render_error_html(refresh_error)
+                    status_code = 500
+                    encoded_body = response_body.encode("utf-8")
+                    self.send_response(status_code)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(encoded_body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(encoded_body)
+                    return
+
+                start_background_refresh(resolved_project_id)
                 response_body = render_loading_html(resolved_project_id)
                 status_code = 200
                 encoded_body = response_body.encode("utf-8")
@@ -2261,8 +2331,18 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             refresh_mode = "incremental"
 
         try:
+            print(
+                f"[server] 更新リクエスト開始: mode={refresh_mode}, project_id={project_id or resolve_project_id(None)}",
+                file=sys.stderr,
+                flush=True,
+            )
             _, resolved_project_id, _ = load_cached_issue_data(
                 project_id, refresh_mode=refresh_mode
+            )
+            print(
+                f"[server] 更新リクエスト完了: project_id={resolved_project_id}",
+                file=sys.stderr,
+                flush=True,
             )
         except (ValueError, RuntimeError) as exc:
             response_body = render_error_html(str(exc))

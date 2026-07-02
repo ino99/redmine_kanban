@@ -10,8 +10,7 @@ services:
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
-    ports:
-      - "${KANBAN_PORT:-8015}:8000"
+    network_mode: host
     volumes:
       - ./redmine_issues.py:/app/redmine_issues.py:ro
-    command: ["python", "redmine_issues.py", "--serve", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["python", "redmine_issues.py", "--serve", "--host", "127.0.0.1", "--port", "${KANBAN_PORT:-8015}"]

@@ -34,13 +34,17 @@ HTTP_PROXY=
 HTTPS_PROXY=
 NO_PROXY=localhost,127.0.0.1
 REDMINE_FETCH_WORKERS=4
-REDMINE_FETCH_RETRIES=3
+REDMINE_FETCH_RETRIES=0
 REDMINE_TIME_ENTRY_PAGES=2
+REDMINE_TIME_ENTRY_TIMEOUT_SECONDS=8
+REDMINE_TIME_ENTRY_RETRIES=0
 ```
 
 `REDMINE_URL` は自分のRedmine URL、`REDMINE_API_KEY` は自分のAPIキー、`PROJECT_ID` はRedmineのプロジェクト識別子に置き換えてください。
 Dockerコンテナ内からプロキシ経由でRedmineへアクセスする場合は、必要に応じて `HTTP_PROXY` と `HTTPS_PROXY` も設定してください。
-`REDMINE_FETCH_WORKERS` はIssueページを並列取得する数です。`REDMINE_TIME_ENTRY_PAGES` は作業時間コメントを探すために `/time_entries.json` から取得するページ数です。重い場合は `1`、不要な場合は `0` にしてください。
+`REDMINE_FETCH_WORKERS` はIssueページを並列取得する数です。`REDMINE_FETCH_RETRIES` はIssue取得のリトライ回数です。
+`REDMINE_TIME_ENTRY_PAGES` は作業時間コメントを探すために `/time_entries.json` から取得するページ数です。重い場合は `1`、不要な場合は `0` にしてください。
+`REDMINE_TIME_ENTRY_TIMEOUT_SECONDS` と `REDMINE_TIME_ENTRY_RETRIES` は作業時間コメント取得が重いときの待ち時間調整に使います。
 
 ## 実行
 
