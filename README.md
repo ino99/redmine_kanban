@@ -1,81 +1,23 @@
 # Redmine Kanban Board
 
-Redmine REST API からIssueを取得し、ブラウザで開ける `kanban.html` を生成するローカル実行前提のPythonツールです。Redmine APIキーは各ユーザーの `.env` に保存し、GitHubには登録しません。
+Redmine REST API からIssueを取得し、ローカルブラウザでKanban表示するツールです。
+Redmine APIキーは各ユーザーの `.env` に保存し、GitHubには登録しません。
 
 ## セキュリティ
 
 - APIキーを画面共有やスクリーンショットで見せないでください。
 - `.env` はコミットしないでください。
+- `.cache/` はRedmineのIssue内容を保存するため、コミットしないでください。
 - GitHubには `.env.example` のみ登録します。
 - 誤ってAPIキーをコミットした場合は、履歴削除だけでなくAPIキーを再発行してください。
 - 可能であれば読み取り専用のAPIキーを使ってください。
-- GitHubにpushする前に必ず `git status` を確認してください。
+- GitHubにpushする前に必ず `git status` と `git ls-files` を確認してください。
 - `docker compose config` は `.env` の値を表示するため、出力を共有しないでください。
 
-## セットアップ
+## 設定
 
-Python 3.10以上を想定しています。外部ライブラリは使っていませんが、将来の依存追加に備えて `requirements.txt` を置いています。
-
-### WindowsのPythonで実行する場合
-
-PowerShellでこのフォルダを開き、次を実行します。
-
-```powershell
-.\run_windows.ps1
-```
-
-初回実行時に `.venv` を作成し、`.env` がなければ `.env.example` からコピーします。
-Redmineに接続する場合は、作成された `.env` の `REDMINE_URL`、`REDMINE_API_KEY`、`PROJECT_ID` を編集してから再実行してください。
-画面だけ確認したい場合は `.env` の `USE_SAMPLE_DATA=true` に変更します。
-
-起動後、ブラウザで次を開きます。
-
-```text
-http://127.0.0.1:8015/kanban.html
-```
-
-一度Redmineから取得したIssueは `.cache/` に保存されます。
-2回目以降のアプリ起動直後は `.cache/` からすぐ表示し、その後バックグラウンドでRedmineから差分を取得します。
-完全に取り直したい場合は画面上部の `全更新` を押してください。
-
-PowerShellの実行ポリシーで `.ps1` を起動できない場合は、代わりにコマンドプロンプトから次を実行できます。
-
-```bat
-run_windows.bat
-```
-
-Windowsにログオンしたとき自動で起動してブラウザも開くようにする場合は、PowerShellで次を実行します。
-
-```powershell
-.\install_windows_startup.ps1
-```
-
-自動起動をやめる場合は次を実行します。
-
-```powershell
-.\uninstall_windows_startup.ps1
-```
-
-ポートを変更する場合は、Pythonスクリプトの引数をそのまま渡せます。
-
-```powershell
-.\run_windows.ps1 --serve --port 8001
-```
-
-```bat
-run_windows.bat --serve --port 8001
-```
-
-従来どおり手動でセットアップする場合:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-```
-
-`.env` を編集します。
+初回起動前に `.env.example` を `.env` にコピーし、Redmine接続情報を編集します。
+Windowsの起動スクリプトを使う場合、`.env` がなければ初回実行時に自動作成されます。
 
 ```env
 REDMINE_URL=https://redmine.example.com
@@ -93,50 +35,65 @@ REDMINE_TIME_ENTRY_RETRIES=0
 ```
 
 `REDMINE_URL` は自分のRedmine URL、`REDMINE_API_KEY` は自分のAPIキー、`PROJECT_ID` はRedmineのプロジェクト識別子に置き換えてください。
-Dockerコンテナ内からプロキシ経由でRedmineへアクセスする場合は、必要に応じて `HTTP_PROXY` と `HTTPS_PROXY` も設定してください。
-`REDMINE_FETCH_WORKERS` はIssueページを並列取得する数です。`REDMINE_FETCH_RETRIES` はIssue取得のリトライ回数です。
+プロキシ経由でRedmineへアクセスする場合は、必要に応じて `HTTP_PROXY` と `HTTPS_PROXY` も設定してください。
+
+`REDMINE_FETCH_WORKERS` はIssueページを並列取得する数です。
+`REDMINE_FETCH_RETRIES` はIssue取得のリトライ回数です。
 `REDMINE_TIME_ENTRY_PAGES` は作業時間コメントを探すために `/time_entries.json` から取得するページ数です。重い場合は `1`、不要な場合は `0` にしてください。
 `REDMINE_TIME_ENTRY_TIMEOUT_SECONDS` と `REDMINE_TIME_ENTRY_RETRIES` は作業時間コメント取得が重いときの待ち時間調整に使います。
 
-## 実行
+## Windowsで起動
 
-通常はローカルサーバーモードを使います。このモードでは `kanban.html` ファイルを生成せず、ブラウザからアクセスされたときにPythonがHTMLを返します。
+PowerShellでこのフォルダを開き、次を実行します。
 
-```bash
-python3 redmine_issues.py --serve
+```powershell
+.\run_windows.ps1
 ```
 
-ブラウザで開きます。
+起動後、ブラウザで次を開きます。
 
 ```text
-http://127.0.0.1:8000/kanban.html
+http://127.0.0.1:8015/kanban.html
 ```
 
-Issueの取得結果だけをターミナルで確認したい場合は、`--serve` を付けずに実行します。この場合も `kanban.html` は生成しません。
+PowerShellの実行ポリシーで `.ps1` を起動できない場合は、コマンドプロンプトから次を実行します。
 
-```bash
-python3 redmine_issues.py
+```bat
+run_windows.bat
 ```
 
-静的HTMLファイルが必要な場合だけ、明示的に `--write-html` を指定します。
+ポートを変更する場合は、起動スクリプトに引数を渡します。
 
-```bash
-python3 redmine_issues.py --write-html
+```powershell
+.\run_windows.ps1 --serve --port 8001
 ```
 
-`kanban.html` は生成物です。GitHubには登録しません。
-
-このURLを開くと、Python側がキャッシュしているIssueをHTMLとして返します。画面上部の `更新` を押したときだけ、前回取得日の1日前以降に変わったIssueをRedmine APIから差分取得してキャッシュに反映します。`全更新` を押すと全Issueを再取得します。APIキーはブラウザには出さず、ローカルのPythonプロセス内だけで使います。終了するときはターミナルで `Ctrl+C` を押してください。
-
-画面上部の `PROJECT_ID` に別のプロジェクト識別子を入力して `表示` を押すと、そのPROJECT_IDのキャッシュを表示します。未取得のPROJECT_IDでは初回だけRedmine APIから全件取得します。最新状態へ更新したい場合は `更新` を押してください。Issue削除や別プロジェクトへの移動まで反映したい場合は `全更新` を押してください。初期値は `.env` の `PROJECT_ID` で、未設定の場合は `my-redmine-project` です。
-
-## Dockerで実行
-
-Docker内でローカルサーバーモードを起動できます。APIキーを含む `.env` はイメージにコピーせず、実行時に `env_file` として読み込みます。
-
-```bash
-cp .env.example .env
+```bat
+run_windows.bat --serve --port 8001
 ```
+
+この場合は `http://127.0.0.1:8001/kanban.html` を開きます。
+
+## Windowsログオン時に自動起動
+
+Windowsにログオンしたとき、自動でローカルサーバーを起動してブラウザも開くようにする場合は、PowerShellで次を実行します。
+
+```powershell
+.\install_windows_startup.ps1
+```
+
+登録後は、次回Windowsログオン時に `http://127.0.0.1:8015/kanban.html` が開きます。
+
+自動起動をやめる、またはアンインストールする場合は次を実行します。
+
+```powershell
+.\uninstall_windows_startup.ps1
+```
+
+## Dockerで起動
+
+Docker内でローカルサーバーを起動できます。
+APIキーを含む `.env` はイメージにコピーせず、実行時に `env_file` として読み込みます。
 
 `.env` を編集したうえで起動します。
 
@@ -149,8 +106,6 @@ docker compose up --build
 ```text
 http://127.0.0.1:8015/kanban.html
 ```
-
-画面上部の `更新` を押すと、コンテナ内のPythonプロセスがRedmine APIから差分取得します。必要に応じて `全更新` で全Issueを再取得できます。
 
 ポートを変更したい場合は、起動時に `KANBAN_PORT` を指定します。
 
@@ -167,29 +122,40 @@ docker build -t redmine-kanban .
 docker run --rm --env-file .env -p 8000:8000 redmine-kanban
 ```
 
-`.dockerignore` により `.env`, `kanban.html`, `__pycache__/` などはDockerビルドコンテキストから除外されます。
+`.dockerignore` により `.env`, `.cache/`, `kanban.html`, `__pycache__/` などはDockerビルドコンテキストから除外されます。
+
+## 画面の使い方
+
+画面上部の `PROJECT_ID` に別のプロジェクト識別子を入力して `表示` を押すと、そのPROJECT_IDのキャッシュを表示します。
+未取得のPROJECT_IDでは初回だけRedmine APIから全件取得します。
+
+画面上部の `更新` を押すと、前回取得日の1日前以降に変わったIssueをRedmine APIから差分取得してキャッシュに反映します。
+`全更新` を押すと全Issueを再取得します。
+更新中は画面上部に小さく状態表示が出ます。
+
+APIキーはブラウザには出さず、ローカルのプロセス内だけで使います。
+
+## ローカルキャッシュ
+
+一度Redmineから取得したIssueは `.cache/` に保存されます。
+2回目以降のアプリ起動直後は `.cache/` からすぐ表示し、その後バックグラウンドでRedmineから差分を取得します。
+完全に取り直したい場合は画面上部の `全更新` を押してください。
+
+`.cache/` にはRedmineのIssue内容が入るため、GitHubには登録しません。
 
 ## サンプルデータモード
 
 Redmine APIに接続せず、サンプルIssueで画面だけ確認できます。
-
 `.env` の値を変更します。
 
 ```env
 USE_SAMPLE_DATA=true
 ```
 
-その後、通常どおり実行します。
+その後、通常どおり `run_windows.ps1`、`run_windows.bat`、またはDockerで起動してください。
+サンプルデータモードではAPIキーを使いません。
 
-```bash
-python3 redmine_issues.py
-```
-
-サンプルデータモードではAPIキーを使いません。フィルタ、作業負荷サマリー、古い完了Issueの非表示などの画面挙動を確認できます。
-
-## 生成されるHTML
-
-`kanban.html` はCSSとJavaScriptを同じファイル内に含む静的HTMLです。ブラウザでそのまま開けます。
+## 画面機能
 
 - ステータスごとの横スクロールKanban
 - 担当者フィルタ
@@ -203,97 +169,26 @@ python3 redmine_issues.py
 - 注意ラベルと夕会確認項目
 - closed / canceled / 終了 / 完了 / キャンセルで7日以上更新がないIssueの非表示
 
-WSL上で作業している場合は、Windows側から以下で開けます。
-
-```bash
-explorer.exe /path/to/redmine-kanban-agent/kanban.html
-```
-
-または簡易HTTPサーバーを使います。
-
-```bash
-python3 -m http.server 8000
-```
-
-ブラウザで `http://localhost:8000/kanban.html` を開きます。
-
-ポート `8000` が使用中の場合は、別のポートを指定します。
-
-```bash
-python3 redmine_issues.py --serve --port 8001
-```
-
-ブラウザで `http://127.0.0.1:8001/kanban.html` を開きます。
-
-## テーマ切替
-
-`kanban.html` 上部のテーマ選択で以下を切り替えられます。
-
-- `OS設定に合わせる`
-- `ライト`
-- `ダーク`
-
-選択したテーマはブラウザの `localStorage` に `redmine-kanban-theme` というキーで保存されます。次回 `kanban.html` を開いたときも同じテーマで表示されます。
-
-テーマ切替、担当者フィルタ、対象バージョンフィルタ、作業負荷サマリーはすべて `kanban.html` 内のCSSとJavaScriptだけで動作します。サーバーは不要です。
-
-ただし、Redmine本体の更新を画面の `更新` ボタンで反映したい場合は `python3 redmine_issues.py --serve` のローカルサーバーモードを使ってください。静的な `kanban.html` を直接開いている場合、F5は既存ファイルを読み直すだけで、Redmine APIへの再取得は行いません。
-
 ## GitHub登録前の確認
 
-まずローカルGit環境を準備します。
+`.env`、`.cache/`、生成物、仮想環境がGit管理対象に入らないことを確認します。
 
 ```bash
-git init
-git branch -M main
+git status --ignored
+git ls-files
 ```
 
-`.env` がGit管理対象に入らないことを確認します。
+`git ls-files` に以下が出てこなければOKです。
 
-```bash
-git status
-git check-ignore -v .env
+```text
+.env
+.cache/
+kanban.html
+.venv/
+__pycache__/
 ```
-
-`git check-ignore -v .env` で `.gitignore` の `.env` 行が表示されればOKです。`git status` に `.env` が表示されないことも確認してください。
 
 `.env.example` はGit管理対象に含めます。
-
-```bash
-git add .
-git status
-```
-
-この時点で `.env` や `kanban.html` が含まれていないこと、`.env.example` が含まれていることを確認してください。
-
-## 初回コミット
-
-```bash
-git commit -m "Initial local Redmine kanban agent"
-```
-
-GitHubでリポジトリを作成した後、remoteを追加してpushします。
-
-```bash
-git remote add origin https://github.com/OWNER/redmine-kanban-agent.git
-git push -u origin main
-```
-
-`OWNER` は自分のGitHubユーザー名またはOrganization名に置き換えてください。
-
-## Git操作の流れ
-
-```bash
-git init
-git branch -M main
-git status
-git check-ignore -v .env
-git add .
-git status
-git commit -m "Initial local Redmine kanban agent"
-git remote add origin https://github.com/OWNER/redmine-kanban-agent.git
-git push -u origin main
-```
 
 ## トラブルシューティング
 
@@ -321,29 +216,16 @@ git restore --staged .env
 - Redmine側でREST APIが有効か確認してください。
 - APIキーの権限を確認してください。
 - `PROJECT_ID` がRedmineのプロジェクト識別子と一致しているか確認してください。
-
-### まず画面だけ確認したい
-
-`.env` でサンプルデータモードを有効にします。
-
-```env
-USE_SAMPLE_DATA=true
-```
-
-その後 `python3 redmine_issues.py` を実行してください。
-
-### `kanban.html` がGitに入りそうになる
-
-`kanban.html` は生成物です。以下で無視されていることを確認してください。
-
-```bash
-git check-ignore -v kanban.html
-```
+- プロキシ環境では `HTTP_PROXY` と `HTTPS_PROXY` を確認してください。
 
 ### `Address already in use` と表示される
 
 ローカルサーバーのポートが既に使われています。別のポートで起動してください。
 
-```bash
-python3 redmine_issues.py --serve --port 8001
+```powershell
+.\run_windows.ps1 --serve --port 8001
+```
+
+```bat
+run_windows.bat --serve --port 8001
 ```
