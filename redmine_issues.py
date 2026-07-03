@@ -2570,11 +2570,16 @@ def serve_kanban(host: str, port: int) -> int:
 
 
 def parse_args() -> Any:
-    parser = ArgumentParser(description="Generate or serve a Redmine Kanban Board.")
+    parser = ArgumentParser(description="Fetch or serve a Redmine Kanban Board.")
     parser.add_argument(
         "--serve",
         action="store_true",
         help="Start a local server. The refresh button fetches Redmine again.",
+    )
+    parser.add_argument(
+        "--write-html",
+        action="store_true",
+        help="Write kanban.html. By default, no HTML file is generated.",
     )
     parser.add_argument("--host", default=DEFAULT_SERVE_HOST, help="Host for --serve.")
     parser.add_argument(
@@ -2593,7 +2598,11 @@ def main() -> int:
 
     try:
         redmine_url, project_id, issues, visible_issues = load_issue_data()
-        output_path = write_kanban_html(visible_issues, redmine_url, project_id)
+        output_path = (
+            write_kanban_html(visible_issues, redmine_url, project_id)
+            if args.write_html
+            else None
+        )
     except (ValueError, RuntimeError) as exc:
         print(f"エラー: {exc}", file=sys.stderr)
         return 1
@@ -2603,7 +2612,11 @@ def main() -> int:
     print_issue_summary(visible_issues)
     print_alert_issues(visible_issues, redmine_url)
     print()
-    print(f"kanban.html: {output_path}")
+    if output_path:
+        print(f"kanban.html: {output_path}")
+    else:
+        print("kanban.html generation skipped. Use --serve to view in a browser.")
+        print("Use --write-html only when you need to create a standalone HTML file.")
     return 0
 
 
