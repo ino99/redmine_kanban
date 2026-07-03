@@ -16,6 +16,58 @@ Redmine REST API からIssueを取得し、ブラウザで開ける `kanban.html
 
 Python 3.10以上を想定しています。外部ライブラリは使っていませんが、将来の依存追加に備えて `requirements.txt` を置いています。
 
+### WindowsのPythonで実行する場合
+
+PowerShellでこのフォルダを開き、次を実行します。
+
+```powershell
+.\run_windows.ps1
+```
+
+初回実行時に `.venv` を作成し、`.env` がなければ `.env.example` からコピーします。
+Redmineに接続する場合は、作成された `.env` の `REDMINE_URL`、`REDMINE_API_KEY`、`PROJECT_ID` を編集してから再実行してください。
+画面だけ確認したい場合は `.env` の `USE_SAMPLE_DATA=true` に変更します。
+
+起動後、ブラウザで次を開きます。
+
+```text
+http://127.0.0.1:8015/kanban.html
+```
+
+一度Redmineから取得したIssueは `.cache/` に保存されます。
+2回目以降のアプリ起動直後は `.cache/` からすぐ表示し、その後バックグラウンドでRedmineから差分を取得します。
+完全に取り直したい場合は画面上部の `全更新` を押してください。
+
+PowerShellの実行ポリシーで `.ps1` を起動できない場合は、代わりにコマンドプロンプトから次を実行できます。
+
+```bat
+run_windows.bat
+```
+
+Windowsにログオンしたとき自動で起動してブラウザも開くようにする場合は、PowerShellで次を実行します。
+
+```powershell
+.\install_windows_startup.ps1
+```
+
+自動起動をやめる場合は次を実行します。
+
+```powershell
+.\uninstall_windows_startup.ps1
+```
+
+ポートを変更する場合は、Pythonスクリプトの引数をそのまま渡せます。
+
+```powershell
+.\run_windows.ps1 --serve --port 8001
+```
+
+```bat
+run_windows.bat --serve --port 8001
+```
+
+従来どおり手動でセットアップする場合:
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -28,7 +80,7 @@ cp .env.example .env
 ```env
 REDMINE_URL=https://redmine.example.com
 REDMINE_API_KEY=replace_with_your_api_key
-PROJECT_ID=forkers-v3-development
+PROJECT_ID=my-redmine-project
 USE_SAMPLE_DATA=false
 HTTP_PROXY=
 HTTPS_PROXY=
@@ -76,7 +128,7 @@ http://127.0.0.1:8000/kanban.html
 
 このURLを開くと、Python側がキャッシュしているIssueをHTMLとして返します。画面上部の `更新` を押したときだけ、前回取得日の1日前以降に変わったIssueをRedmine APIから差分取得してキャッシュに反映します。`全更新` を押すと全Issueを再取得します。APIキーはブラウザには出さず、ローカルのPythonプロセス内だけで使います。終了するときはターミナルで `Ctrl+C` を押してください。
 
-画面上部の `PROJECT_ID` に別のプロジェクト識別子を入力して `表示` を押すと、そのPROJECT_IDのキャッシュを表示します。未取得のPROJECT_IDでは初回だけRedmine APIから全件取得します。最新状態へ更新したい場合は `更新` を押してください。Issue削除や別プロジェクトへの移動まで反映したい場合は `全更新` を押してください。初期値は `.env` の `PROJECT_ID` で、未設定の場合は `forkers-v3-development` です。
+画面上部の `PROJECT_ID` に別のプロジェクト識別子を入力して `表示` を押すと、そのPROJECT_IDのキャッシュを表示します。未取得のPROJECT_IDでは初回だけRedmine APIから全件取得します。最新状態へ更新したい場合は `更新` を押してください。Issue削除や別プロジェクトへの移動まで反映したい場合は `全更新` を押してください。初期値は `.env` の `PROJECT_ID` で、未設定の場合は `my-redmine-project` です。
 
 ## Dockerで実行
 

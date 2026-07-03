@@ -5,6 +5,7 @@
 .agents/
 .codex/
 __pycache__/
+.cache/
 .venv/
 venv/
 env/

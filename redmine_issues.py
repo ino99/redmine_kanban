@@ -2,6 +2,7 @@
 """Fetch Redmine issues with the REST API."""
 
 import html
+import hashlib
 import json
 import os
 import sys
@@ -30,9 +31,11 @@ FETCH_RETRY_DELAY_SECONDS = 1.0
 TIME_ENTRY_PAGE_LIMIT = 100
 DEFAULT_TIME_ENTRY_PAGES = 2
 OUTPUT_HTML = "kanban.html"
+CACHE_DIR = Path(".cache")
+CACHE_SCHEMA_VERSION = 1
 DEFAULT_SERVE_HOST = "127.0.0.1"
 DEFAULT_SERVE_PORT = 8000
-DEFAULT_PROJECT_ID = "forkers-v3-development"
+DEFAULT_PROJECT_ID = "my-redmine-project"
 STATUS_ORDER = [
     "new",
     "assigned",
@@ -66,6 +69,7 @@ ISSUE_CACHE: dict[str, IssueCacheEntry] = {}
 ISSUE_CACHE_LOCK = RLock()
 ISSUE_REFRESH_IN_PROGRESS: set[str] = set()
 ISSUE_REFRESH_ERRORS: dict[str, str] = {}
+ISSUE_STARTUP_REFRESH_STARTED: set[str] = set()
 
 
 def load_env(path: str = ".env") -> None:
@@ -696,6 +700,7 @@ def render_project_control(project_id: str) -> str:
           <button type="submit">表示</button>
           <button type="submit" name="refresh_mode" value="incremental" formmethod="post" formaction="/refresh">更新</button>
           <button type="submit" name="refresh_mode" value="full" formmethod="post" formaction="/refresh">全更新</button>
+          <span class="refresh-status" id="refresh-status" role="status" aria-live="polite"></span>
         </form>"""
 
 
@@ -1146,6 +1151,40 @@ def render_kanban_html(
 
     .project-control button:hover {{
       background: var(--button-hover-bg);
+    }}
+
+    .project-control button.is-refreshing {{
+      opacity: 0.72;
+      cursor: progress;
+    }}
+
+    .refresh-status {{
+      display: none;
+      grid-column: 1 / -1;
+      align-items: center;
+      gap: 8px;
+      min-height: 18px;
+      color: var(--body-muted-text);
+      font-size: 12px;
+      font-weight: 700;
+    }}
+
+    .refresh-status.is-visible {{
+      display: inline-flex;
+    }}
+
+    .refresh-status::before {{
+      width: 12px;
+      height: 12px;
+      border: 2px solid var(--control-border);
+      border-top-color: var(--link-color);
+      border-radius: 999px;
+      content: "";
+      animation: refresh-spin 0.8s linear infinite;
+    }}
+
+    @keyframes refresh-spin {{
+      to {{ transform: rotate(360deg); }}
     }}
 
     .assignee-filter,
@@ -1662,6 +1701,8 @@ def render_kanban_html(
     const resetFiltersButton = document.getElementById("reset-filters");
     const visibleIssueCount = document.getElementById("visible-issue-count");
     const workloadGrid = document.getElementById("workload-grid");
+    const projectControl = document.querySelector(".project-control");
+    const refreshStatus = document.getElementById("refresh-status");
 
     function getSavedTheme() {{
       const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
@@ -1895,11 +1936,34 @@ def render_kanban_html(
       applyFilters();
     }}
 
+    function initializeRefreshStatus() {{
+      if (!projectControl || !refreshStatus) {{
+        return;
+      }}
+
+      projectControl.addEventListener("submit", (event) => {{
+        const submitter = event.submitter;
+        if (!submitter || submitter.name !== "refresh_mode") {{
+          return;
+        }}
+
+        const isFullRefresh = submitter.value === "full";
+        refreshStatus.textContent = isFullRefresh ? "全更新中..." : "更新中...";
+        refreshStatus.classList.add("is-visible");
+        submitter.classList.add("is-refreshing");
+        submitter.setAttribute("aria-busy", "true");
+        window.requestAnimationFrame(() => {{
+          submitter.disabled = true;
+        }});
+      }});
+    }}
+
     assigneeFilter.addEventListener("change", applyFilters);
     versionAll.addEventListener("change", handleVersionAllChange);
     versionCheckboxes.forEach((checkbox) => checkbox.addEventListener("change", handleVersionCheckboxChange));
     resetFiltersButton.addEventListener("click", resetFilters);
     initializeThemeSelector();
+    initializeRefreshStatus();
     applyFilters();
   </script>
 </body>
@@ -1915,6 +1979,103 @@ def write_kanban_html(
         render_kanban_html(issues, redmine_url, project_id), encoding="utf-8"
     )
     return output_path
+
+
+def disk_cache_redmine_url() -> str | None:
+    if env_flag("USE_SAMPLE_DATA"):
+        return None
+    return os.getenv("REDMINE_URL")
+
+
+def disk_cache_path(project_id: str, redmine_url: str) -> Path:
+    cache_key = hashlib.sha256(
+        f"{redmine_url.rstrip('/')}|{project_id}".encode("utf-8")
+    ).hexdigest()[:16]
+    return CACHE_DIR / f"issues-{cache_key}.json"
+
+
+def load_issue_cache_from_disk(project_id: str) -> IssueCacheEntry | None:
+    redmine_url = disk_cache_redmine_url()
+    if not redmine_url:
+        return None
+
+    cache_path = disk_cache_path(project_id, redmine_url)
+    if not cache_path.exists():
+        return None
+
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"[server] Failed to read disk cache {cache_path}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+    if data.get("schema_version") != CACHE_SCHEMA_VERSION:
+        return None
+    if data.get("project_id") != project_id:
+        return None
+    if str(data.get("redmine_url") or "").rstrip("/") != redmine_url.rstrip("/"):
+        return None
+
+    issues = data.get("issues")
+    if not isinstance(issues, list):
+        return None
+
+    refreshed_at = parse_datetime(data.get("refreshed_at"))
+    if refreshed_at is None:
+        return None
+
+    return IssueCacheEntry(redmine_url=redmine_url, issues=issues, refreshed_at=refreshed_at)
+
+
+def save_issue_cache_to_disk(project_id: str, cache_entry: IssueCacheEntry) -> None:
+    cache_redmine_url = disk_cache_redmine_url()
+    if not cache_redmine_url:
+        return
+
+    try:
+        CACHE_DIR.mkdir(exist_ok=True)
+        cache_path = disk_cache_path(project_id, cache_redmine_url)
+        payload = {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "redmine_url": cache_entry.redmine_url,
+            "project_id": project_id,
+            "refreshed_at": cache_entry.refreshed_at.isoformat(),
+            "issues": cache_entry.issues,
+        }
+        cache_path.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(
+            f"[server] Failed to write disk cache: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def ensure_issue_cache_loaded_from_disk(project_id: str) -> bool:
+    with ISSUE_CACHE_LOCK:
+        if project_id in ISSUE_CACHE:
+            return True
+
+    cache_entry = load_issue_cache_from_disk(project_id)
+    if cache_entry is None:
+        return False
+
+    with ISSUE_CACHE_LOCK:
+        ISSUE_CACHE.setdefault(project_id, cache_entry)
+
+    print(
+        f"[server] Loaded issue cache from disk: project_id={project_id}, issues={len(cache_entry.issues)}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return True
 
 
 def resolve_project_id(project_id_override: str | None = None) -> str:
@@ -2036,20 +2197,29 @@ def load_cached_issue_data(
         issues = merge_issues(cached_issues, issues)
         visible_issues = displayable_issues(issues)
 
+    cache_entry = IssueCacheEntry(
+        redmine_url=redmine_url,
+        issues=issues,
+        refreshed_at=datetime.now(timezone.utc),
+    )
     with ISSUE_CACHE_LOCK:
-        ISSUE_CACHE[resolved_project_id] = IssueCacheEntry(
-            redmine_url=redmine_url,
-            issues=issues,
-            refreshed_at=datetime.now(timezone.utc),
-        )
+        ISSUE_CACHE[resolved_project_id] = cache_entry
+
+    save_issue_cache_to_disk(resolved_project_id, cache_entry)
 
     return redmine_url, resolved_project_id, visible_issues
 
 
-def start_background_refresh(project_id: str, refresh_mode: str = "full") -> None:
+def start_background_refresh(
+    project_id: str, refresh_mode: str = "full", once_per_startup: bool = False
+) -> None:
     with ISSUE_CACHE_LOCK:
-        if project_id in ISSUE_CACHE or project_id in ISSUE_REFRESH_IN_PROGRESS:
+        if once_per_startup and project_id in ISSUE_STARTUP_REFRESH_STARTED:
             return
+        if project_id in ISSUE_REFRESH_IN_PROGRESS:
+            return
+        if once_per_startup:
+            ISSUE_STARTUP_REFRESH_STARTED.add(project_id)
         ISSUE_REFRESH_IN_PROGRESS.add(project_id)
         ISSUE_REFRESH_ERRORS.pop(project_id, None)
 
@@ -2271,6 +2441,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
 
         try:
             resolved_project_id = resolve_project_id(project_id)
+            ensure_issue_cache_loaded_from_disk(resolved_project_id)
             with ISSUE_CACHE_LOCK:
                 has_cache = resolved_project_id in ISSUE_CACHE
                 refresh_error = ISSUE_REFRESH_ERRORS.get(resolved_project_id)
@@ -2300,6 +2471,11 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                 return
 
             redmine_url, resolved_project_id, visible_issues = load_cached_issue_data(project_id)
+            start_background_refresh(
+                resolved_project_id,
+                refresh_mode="incremental",
+                once_per_startup=True,
+            )
             response_body = render_kanban_html(
                 visible_issues, redmine_url, resolved_project_id
             )
