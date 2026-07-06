@@ -76,7 +76,7 @@ run_windows.bat --serve --port 8001
 
 ## Windowsログオン時に自動起動
 
-Windowsにログオンしたとき、自動でローカルサーバーを起動してブラウザも開くようにする場合は、PowerShellで次を実行します。
+Windowsにログオンしたとき、自動でローカルサーバーをバックグラウンド起動してブラウザも開くようにする場合は、PowerShellで次を実行します。
 
 ```powershell
 .\install_windows_startup.ps1

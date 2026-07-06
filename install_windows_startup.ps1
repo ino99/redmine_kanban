@@ -5,10 +5,10 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 
-$scriptPath = Join-Path $PSScriptRoot "run_windows.ps1"
-$argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -OpenBrowser"
+$launcherPath = Join-Path $PSScriptRoot "run_windows_hidden.vbs"
+$argument = "//NoLogo `"$launcherPath`""
 
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argument -WorkingDirectory $PSScriptRoot
+$action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument $argument -WorkingDirectory $PSScriptRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit 0 -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 

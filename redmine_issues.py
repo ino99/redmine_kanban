@@ -30,6 +30,8 @@ DEFAULT_TIME_ENTRY_RETRIES = 0
 FETCH_RETRY_DELAY_SECONDS = 1.0
 TIME_ENTRY_PAGE_LIMIT = 100
 DEFAULT_TIME_ENTRY_PAGES = 2
+SUB_ASSIGNEE_FIELD_NAME = "副担当者"
+SUB_ASSIGNEE_CACHE_FIELD = "_sub_assignees"
 OUTPUT_HTML = "kanban.html"
 CACHE_DIR = Path(".cache")
 CACHE_SCHEMA_VERSION = 1
@@ -151,6 +153,78 @@ def issue_numeric_id(issue: dict[str, Any]) -> int | None:
 
 def assignee_name(issue: dict[str, Any]) -> str:
     return issue_field(issue, "assigned_to", "未設定")
+
+
+def user_reference_name(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    if name:
+        return str(name)
+    return None
+
+
+def user_reference_id(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    user_id = value.get("id")
+    if user_id in (None, ""):
+        return None
+    return str(user_id)
+
+
+def user_id_name_map(issues: list[dict[str, Any]]) -> dict[str, str]:
+    results: dict[str, str] = {}
+    for issue in issues:
+        for field_name in ("assigned_to", "author"):
+            user = issue.get(field_name)
+            user_id = user_reference_id(user)
+            user_name = user_reference_name(user)
+            if user_id and user_name:
+                results[user_id] = user_name
+    return results
+
+
+def sub_assignee_ids(issue: dict[str, Any]) -> list[str]:
+    custom_fields = issue.get("custom_fields")
+    if not isinstance(custom_fields, list):
+        return []
+
+    for field in custom_fields:
+        if not isinstance(field, dict):
+            continue
+        if str(field.get("name") or "") != SUB_ASSIGNEE_FIELD_NAME:
+            continue
+
+        value = field.get("value")
+        if isinstance(value, list):
+            return [str(item) for item in value if item not in (None, "")]
+        if value not in (None, ""):
+            return [str(value)]
+        return []
+
+    return []
+
+
+def sub_assignee_names(issue: dict[str, Any]) -> list[str]:
+    cached = issue.get(SUB_ASSIGNEE_CACHE_FIELD)
+    if isinstance(cached, list):
+        return [str(name) for name in cached if name]
+    return []
+
+
+def participant_names(issue: dict[str, Any]) -> list[str]:
+    names = [assignee_name(issue)]
+    names.extend(sub_assignee_names(issue))
+
+    unique_names = []
+    seen = set()
+    for name in names:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        unique_names.append(name)
+    return unique_names
 
 
 def fixed_version_name(issue: dict[str, Any]) -> str:
@@ -276,7 +350,10 @@ def sample_issues() -> list[dict[str, Any]]:
             "assigned_to": {"name": "佐藤"},
             "priority": {"name": "High"},
             "fixed_version": {"name": "1.2.0"},
-            "custom_fields": [{"name": "残作業時間", "value": "3.5"}],
+            "custom_fields": [
+                {"name": "残作業時間", "value": "3.5"},
+                {"name": "副担当者", "value": ["田中"]},
+            ],
             "_latest_time_entry": {
                 "spent_on": "2026-06-30",
                 "user": "佐藤",
@@ -411,6 +488,61 @@ def fetch_issues(
         issues.extend(pages.get(offset, []))
 
     return issues
+
+
+def fetch_user_name(redmine_url: str, api_key: str, user_id: str) -> str | None:
+    endpoint = urljoin(redmine_url.rstrip("/") + "/", f"users/{user_id}.json")
+    request = Request(endpoint, headers={"X-Redmine-API-Key": api_key})
+
+    try:
+        with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            data = json.load(response)
+    except (HTTPError, TimeoutError, URLError, json.JSONDecodeError) as exc:
+        print(
+            f"[server] 副担当者の名前を取得できませんでした: user_id={user_id}, {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    user = data.get("user")
+    if not isinstance(user, dict):
+        return None
+
+    name = user.get("name")
+    return str(name) if name else None
+
+
+def attach_sub_assignee_names(
+    issues: list[dict[str, Any]], redmine_url: str | None = None, api_key: str | None = None
+) -> None:
+    name_by_id = user_id_name_map(issues)
+    unknown_user_ids = sorted(
+        {
+            user_id
+            for issue in issues
+            for user_id in sub_assignee_ids(issue)
+            if user_id not in name_by_id
+        }
+    )
+
+    if redmine_url and api_key:
+        for user_id in unknown_user_ids:
+            user_name = fetch_user_name(redmine_url, api_key, user_id)
+            if user_name:
+                name_by_id[user_id] = user_name
+
+    for issue in issues:
+        names = []
+        for user_id in sub_assignee_ids(issue):
+            names.append(name_by_id.get(user_id) or user_id)
+        if names:
+            issue[SUB_ASSIGNEE_CACHE_FIELD] = names
+        else:
+            issue.pop(SUB_ASSIGNEE_CACHE_FIELD, None)
 
 
 def fetch_time_entries_page(
@@ -587,7 +719,7 @@ def status_order_key(status_name: str) -> str:
 
 
 def assignee_names(issues: list[dict[str, Any]]) -> list[str]:
-    return sorted({assignee_name(issue) for issue in issues})
+    return sorted({name for issue in issues for name in participant_names(issue)})
 
 
 def fixed_version_names(issues: list[dict[str, Any]]) -> list[str]:
@@ -782,6 +914,8 @@ def render_issue_card(issue: dict[str, Any], redmine_url: str) -> str:
     url = issue_url(issue, redmine_url)
     subject = issue.get("subject") or "-"
     assignee = assignee_name(issue)
+    sub_assignees = sub_assignee_names(issue)
+    participants_json = json.dumps(participant_names(issue), ensure_ascii=False)
     version = fixed_version_name(issue)
     alerts = detect_issue_alerts(issue)
     questions = evening_check_questions(alerts)
@@ -841,6 +975,8 @@ def render_issue_card(issue: dict[str, Any], redmine_url: str) -> str:
         ("期日", issue.get("due_date") or "-"),
         ("最終更新日", issue.get("updated_on") or "-"),
     ]
+    if sub_assignees:
+        fields.insert(2, ("副担当者", ", ".join(sub_assignees)))
     remaining_work = remaining_work_time(issue)
     if remaining_work != "-":
         fields.append(("残作業時間", format_remaining_work_time(remaining_work)))
@@ -854,7 +990,7 @@ def render_issue_card(issue: dict[str, Any], redmine_url: str) -> str:
     )
 
     return f"""
-        <article class="issue-card" data-assignee="{escape_text(assignee)}" data-version="{escape_text(version)}" data-is-closed="{str(is_closed_or_canceled(issue)).lower()}" data-overdue="{str(flags["overdue"]).lower()}" data-high-priority="{str(flags["high_priority"]).lower()}" data-stale="{str(flags["stale"]).lower()}">
+        <article class="issue-card" data-assignee="{escape_text(assignee)}" data-participants="{escape_text(participants_json)}" data-version="{escape_text(version)}" data-is-closed="{str(is_closed_or_canceled(issue)).lower()}" data-overdue="{str(flags["overdue"]).lower()}" data-high-priority="{str(flags["high_priority"]).lower()}" data-stale="{str(flags["stale"]).lower()}">
           <a class="issue-id" href="{escape_text(url)}" target="_blank" rel="noopener noreferrer">#{escape_text(issue_id)}</a>
 {labels_html}
           <h2>{escape_text(subject)}</h2>
@@ -1738,6 +1874,18 @@ def render_kanban_html(
       return new Set(versionCheckboxes.filter((checkbox) => checkbox.checked).map((checkbox) => checkbox.value));
     }}
 
+    function cardParticipants(card) {{
+      try {{
+        const participants = JSON.parse(card.dataset.participants || "[]");
+        if (Array.isArray(participants)) {{
+          return participants;
+        }}
+      }} catch {{
+        return [card.dataset.assignee || "未設定"];
+      }}
+      return [card.dataset.assignee || "未設定"];
+    }}
+
     function workloadLevel(openIssueCount) {{
       if (openIssueCount >= 5) {{
         return ["負荷高", "high"];
@@ -1823,6 +1971,7 @@ def render_kanban_html(
 
     function updateWorkloadSummary(visibleCards) {{
       const workload = new Map();
+      const selectedAssignee = assigneeFilter.value;
 
       visibleCards.forEach((card) => {{
         if (card.dataset.isClosed === "true") {{
@@ -1830,6 +1979,11 @@ def render_kanban_html(
         }}
 
         const assignee = card.dataset.assignee || "未設定";
+        if (selectedAssignee !== "__all__" && assignee !== selectedAssignee) {{
+          return;
+        }}
+
+        // Workload is intentionally grouped by the primary assignee only.
         const item = workload.get(assignee) || {{
           assignee,
           openCount: 0,
@@ -1887,7 +2041,7 @@ def render_kanban_html(
         let columnVisibleCount = 0;
 
         column.querySelectorAll(".issue-card").forEach((card) => {{
-          const assigneeMatches = selectedAssignee === "__all__" || card.dataset.assignee === selectedAssignee;
+          const assigneeMatches = selectedAssignee === "__all__" || cardParticipants(card).includes(selectedAssignee);
           const versionMatches = selectedVersions === null || selectedVersions.has(card.dataset.version);
           const matches = assigneeMatches && versionMatches;
           card.classList.toggle("is-hidden", !matches);
@@ -2067,6 +2221,8 @@ def ensure_issue_cache_loaded_from_disk(project_id: str) -> bool:
     if cache_entry is None:
         return False
 
+    attach_sub_assignee_names(cache_entry.issues)
+
     with ISSUE_CACHE_LOCK:
         ISSUE_CACHE.setdefault(project_id, cache_entry)
 
@@ -2108,6 +2264,11 @@ def load_issue_data(
             file=sys.stderr,
             flush=True,
         )
+
+    if env_flag("USE_SAMPLE_DATA"):
+        attach_sub_assignee_names(issues)
+    else:
+        attach_sub_assignee_names(issues, redmine_url, api_key)
 
     visible_issues = displayable_issues(issues)
     if not env_flag("USE_SAMPLE_DATA"):
