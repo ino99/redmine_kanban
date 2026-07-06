@@ -884,8 +884,11 @@ def render_project_control(project_id: str) -> str:
         <form class="project-control" action="/{OUTPUT_HTML}" method="get">
           <label>
             <span>PROJECT_ID</span>
-            <input type="text" id="project-id-input" name="project_id" list="project-id-history" value="{escape_text(project_id)}">
-            <datalist id="project-id-history"></datalist>
+            <div class="project-id-picker">
+              <input type="text" id="project-id-input" name="project_id" value="{escape_text(project_id)}" autocomplete="off" aria-haspopup="listbox" aria-expanded="false">
+              <button type="button" class="project-id-history-toggle" id="project-id-history-toggle" aria-label="PROJECT_ID履歴を開く" aria-controls="project-id-history-menu">▼</button>
+              <div class="project-id-history-menu" id="project-id-history-menu" role="listbox" hidden></div>
+            </div>
           </label>
           <button type="submit">表示</button>
           <button type="submit" name="refresh_mode" value="incremental" formmethod="post" formaction="/refresh">更新</button>
@@ -1319,16 +1322,115 @@ def render_kanban_html(
       font-weight: 700;
     }}
 
+    .project-id-picker {{
+      position: relative;
+    }}
+
     .project-control input {{
       width: 100%;
       min-height: 34px;
-      padding: 6px 10px;
+      padding: 6px 38px 6px 10px;
       color: var(--control-text);
       background: var(--control-bg);
       border: 1px solid var(--control-border);
       border-radius: 8px;
       font: inherit;
       font-weight: 600;
+    }}
+
+    .project-control .project-id-history-toggle {{
+      position: absolute;
+      top: 1px;
+      right: 1px;
+      width: 34px;
+      min-height: 32px;
+      padding: 0;
+      color: var(--control-text);
+      background: transparent;
+      border: 0;
+      border-left: 1px solid transparent;
+      border-radius: 0 7px 7px 0;
+      font-size: 12px;
+      line-height: 1;
+      cursor: pointer;
+    }}
+
+    .project-control .project-id-history-toggle:hover,
+    .project-control .project-id-history-toggle[aria-expanded="true"] {{
+      background: color-mix(in srgb, var(--control-border) 22%, transparent);
+      border-left-color: var(--control-border);
+    }}
+
+    .project-id-history-menu {{
+      position: absolute;
+      z-index: 30;
+      top: calc(100% + 4px);
+      right: 0;
+      left: 0;
+      max-height: 220px;
+      overflow-y: auto;
+      padding: 4px;
+      background: var(--control-bg);
+      border: 1px solid var(--control-border);
+      border-radius: 8px;
+      box-shadow: 0 14px 30px rgba(0, 0, 0, 0.28);
+    }}
+
+    .project-id-history-option {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 4px;
+      border-radius: 6px;
+    }}
+
+    .project-id-history-option:hover,
+    .project-id-history-option:focus-within {{
+      background: color-mix(in srgb, var(--button-bg) 20%, transparent);
+    }}
+
+    .project-control .project-id-history-select {{
+      min-width: 0;
+      min-height: 30px;
+      padding: 6px 8px;
+      color: var(--control-text);
+      background: transparent;
+      border: 0;
+      border-radius: 6px;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      text-align: left;
+      cursor: pointer;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+
+    .project-control .project-id-history-delete {{
+      width: 28px;
+      min-width: 28px;
+      min-height: 30px;
+      padding: 0 8px;
+      color: var(--control-text);
+      background: transparent;
+      border: 0;
+      border-radius: 6px;
+      font: inherit;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+
+    .project-control .project-id-history-select:focus-visible,
+    .project-control .project-id-history-delete:focus-visible {{
+      outline: none;
+    }}
+
+    .project-control .project-id-history-delete:hover,
+    .project-control .project-id-history-delete:focus-visible {{
+      color: #fca5a5;
+      background: rgba(239, 68, 68, 0.18);
     }}
 
     .project-control button {{
@@ -1923,7 +2025,8 @@ def render_kanban_html(
     const workloadGrid = document.getElementById("workload-grid");
     const projectControl = document.querySelector(".project-control");
     const projectIdInput = document.getElementById("project-id-input");
-    const projectIdHistory = document.getElementById("project-id-history");
+    const projectIdHistoryToggle = document.getElementById("project-id-history-toggle");
+    const projectIdHistoryMenu = document.getElementById("project-id-history-menu");
     const refreshStatus = document.getElementById("refresh-status");
 
     function getSavedTheme() {{
@@ -1974,16 +2077,67 @@ def render_kanban_html(
     }}
 
     function renderProjectIdHistory(history) {{
-      if (!projectIdHistory) {{
+      if (!projectIdHistoryMenu) {{
         return;
       }}
 
-      const options = history.map((projectId) => {{
-        const option = document.createElement("option");
-        option.value = projectId;
-        return option;
+      const menuOptions = history.map((projectId) => {{
+        const row = document.createElement("div");
+        const selectButton = document.createElement("button");
+        const deleteButton = document.createElement("button");
+
+        row.className = "project-id-history-option";
+        row.setAttribute("role", "option");
+
+        selectButton.type = "button";
+        selectButton.className = "project-id-history-select";
+        selectButton.dataset.projectId = projectId;
+        selectButton.textContent = projectId;
+
+        deleteButton.type = "button";
+        deleteButton.className = "project-id-history-delete";
+        deleteButton.dataset.projectId = projectId;
+        deleteButton.setAttribute("aria-label", `${{projectId}} を履歴から削除`);
+        deleteButton.textContent = "×";
+
+        row.append(selectButton, deleteButton);
+        return row;
       }});
-      projectIdHistory.replaceChildren(...options);
+      projectIdHistoryMenu.replaceChildren(...menuOptions);
+    }}
+
+    function closeProjectIdHistoryMenu() {{
+      if (!projectIdHistoryMenu || !projectIdHistoryToggle || !projectIdInput) {{
+        return;
+      }}
+
+      projectIdHistoryMenu.hidden = true;
+      projectIdHistoryToggle.setAttribute("aria-expanded", "false");
+      projectIdInput.setAttribute("aria-expanded", "false");
+    }}
+
+    function openProjectIdHistoryMenu() {{
+      if (!projectIdHistoryMenu || !projectIdHistoryToggle || !projectIdInput) {{
+        return;
+      }}
+
+      renderProjectIdHistory(loadProjectIdHistory());
+      if (!projectIdHistoryMenu.children.length) {{
+        closeProjectIdHistoryMenu();
+        return;
+      }}
+
+      projectIdHistoryMenu.hidden = false;
+      projectIdHistoryToggle.setAttribute("aria-expanded", "true");
+      projectIdInput.setAttribute("aria-expanded", "true");
+    }}
+
+    function toggleProjectIdHistoryMenu() {{
+      if (!projectIdHistoryMenu || projectIdHistoryMenu.hidden) {{
+        openProjectIdHistoryMenu();
+      }} else {{
+        closeProjectIdHistoryMenu();
+      }}
     }}
 
     function rememberProjectId(projectId) {{
@@ -1998,14 +2152,57 @@ def render_kanban_html(
       renderProjectIdHistory(history);
     }}
 
+    function removeProjectIdHistory(projectId) {{
+      const nextHistory = loadProjectIdHistory().filter((value) => value !== projectId);
+      saveProjectIdHistory(nextHistory);
+      renderProjectIdHistory(nextHistory);
+      if (!nextHistory.length) {{
+        closeProjectIdHistoryMenu();
+      }}
+    }}
+
     function initializeProjectIdHistory() {{
-      if (!projectIdInput || !projectIdHistory) {{
+      if (!projectIdInput) {{
         return;
       }}
 
       renderProjectIdHistory(loadProjectIdHistory());
       rememberProjectId(projectIdInput.value);
-      projectIdInput.addEventListener("change", () => rememberProjectId(projectIdInput.value));
+      projectIdInput.addEventListener("input", closeProjectIdHistoryMenu);
+      projectIdInput.addEventListener("keydown", (event) => {{
+        if (event.key === "Escape") {{
+          closeProjectIdHistoryMenu();
+        }}
+      }});
+      if (projectIdHistoryToggle) {{
+        projectIdHistoryToggle.addEventListener("click", toggleProjectIdHistoryMenu);
+      }}
+      if (projectIdHistoryMenu) {{
+        projectIdHistoryMenu.addEventListener("click", (event) => {{
+          const deleteButton = event.target.closest(".project-id-history-delete");
+          if (deleteButton && projectIdHistoryMenu.contains(deleteButton)) {{
+            removeProjectIdHistory(deleteButton.dataset.projectId || "");
+            return;
+          }}
+
+          const selectButton = event.target.closest(".project-id-history-select");
+          if (!selectButton || !projectIdHistoryMenu.contains(selectButton)) {{
+            return;
+          }}
+
+          projectIdInput.value = selectButton.dataset.projectId || "";
+          rememberProjectId(projectIdInput.value);
+          closeProjectIdHistoryMenu();
+          projectIdInput.focus();
+        }});
+      }}
+      document.addEventListener("click", (event) => {{
+        if (!projectControl || projectControl.contains(event.target)) {{
+          return;
+        }}
+
+        closeProjectIdHistoryMenu();
+      }});
       if (projectControl) {{
         projectControl.addEventListener("submit", () => rememberProjectId(projectIdInput.value));
       }}
