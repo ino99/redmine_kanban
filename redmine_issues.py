@@ -32,6 +32,7 @@ TIME_ENTRY_PAGE_LIMIT = 100
 DEFAULT_TIME_ENTRY_PAGES = 2
 SUB_ASSIGNEE_FIELD_NAME = "副担当者"
 SUB_ASSIGNEE_CACHE_FIELD = "_sub_assignees"
+BALL_POSSESSION_FIELD_NAME = "ボール所持"
 OUTPUT_HTML = "kanban.html"
 CACHE_DIR = Path(".cache")
 CACHE_SCHEMA_VERSION = 1
@@ -248,6 +249,37 @@ def remaining_work_time(issue: dict[str, Any]) -> str:
             return str(value)
 
     return "-"
+
+
+def custom_field_values(issue: dict[str, Any], field_name: str) -> list[str]:
+    custom_fields = issue.get("custom_fields")
+    if not isinstance(custom_fields, list):
+        return []
+
+    for field in custom_fields:
+        if not isinstance(field, dict):
+            continue
+        if str(field.get("name") or "") != field_name:
+            continue
+
+        value = field.get("value")
+        if isinstance(value, list):
+            return [str(item) for item in value if item not in (None, "")]
+        if isinstance(value, dict):
+            name = value.get("name")
+            if name:
+                return [str(name)]
+            value_id = value.get("id")
+            return [str(value_id)] if value_id not in (None, "") else []
+        if value not in (None, ""):
+            return [str(value)]
+        return []
+
+    return []
+
+
+def ball_possession_values(issue: dict[str, Any]) -> list[str]:
+    return custom_field_values(issue, BALL_POSSESSION_FIELD_NAME)
 
 
 def format_remaining_work_time(value: str) -> str:
@@ -729,6 +761,11 @@ def fixed_version_names(issues: list[dict[str, Any]]) -> list[str]:
     return configured_names
 
 
+def ball_possession_names(issues: list[dict[str, Any]]) -> list[str]:
+    names = {name for issue in issues for name in ball_possession_values(issue)}
+    return sorted(names)
+
+
 def workload_level(open_issue_count: int) -> tuple[str, str]:
     if open_issue_count >= 5:
         return "負荷高", "high"
@@ -810,6 +847,26 @@ def render_version_filter(issues: list[dict[str, Any]]) -> str:
     </fieldset>"""
 
 
+def render_ball_possession_filter(issues: list[dict[str, Any]]) -> str:
+    names = ball_possession_names(issues)
+    if not names:
+        return ""
+
+    options = ['          <option value="__all__">全て</option>']
+    for name in names:
+        options.append(
+            f'          <option value="{escape_text(name)}">{escape_text(name)}</option>'
+        )
+
+    return f"""
+    <label class="ball-possession-filter">
+      <span>ボール所持</span>
+      <select id="ball-possession-filter">
+{chr(10).join(options)}
+      </select>
+    </label>"""
+
+
 def render_theme_filter() -> str:
     return """
     <label class="theme-filter">
@@ -827,7 +884,8 @@ def render_project_control(project_id: str) -> str:
         <form class="project-control" action="/{OUTPUT_HTML}" method="get">
           <label>
             <span>PROJECT_ID</span>
-            <input type="text" name="project_id" value="{escape_text(project_id)}">
+            <input type="text" id="project-id-input" name="project_id" list="project-id-history" value="{escape_text(project_id)}">
+            <datalist id="project-id-history"></datalist>
           </label>
           <button type="submit">表示</button>
           <button type="submit" name="refresh_mode" value="incremental" formmethod="post" formaction="/refresh">更新</button>
@@ -841,6 +899,7 @@ def render_filter_controls(issues: list[dict[str, Any]]) -> str:
     <div class="filter-controls">
 {render_assignee_filter(issues)}
 {render_version_filter(issues)}
+{render_ball_possession_filter(issues)}
 {render_theme_filter()}
       <button type="button" id="reset-filters">フィルタ解除</button>
     </div>"""
@@ -886,7 +945,7 @@ def render_workload_summary(issues: list[dict[str, Any]]) -> str:
             f"""
       <article class="workload-card workload-{escape_text(level_class)}">
         <header>
-          <h2>{escape_text(item["assignee"])}</h2>
+          <h2><button type="button" class="workload-assignee-button" data-assignee="{escape_text(item["assignee"])}">{escape_text(item["assignee"])}</button></h2>
           <span>{escape_text(level_label)}</span>
         </header>
         <dl>
@@ -917,6 +976,7 @@ def render_issue_card(issue: dict[str, Any], redmine_url: str) -> str:
     sub_assignees = sub_assignee_names(issue)
     participants_json = json.dumps(participant_names(issue), ensure_ascii=False)
     version = fixed_version_name(issue)
+    ball_possession_json = json.dumps(ball_possession_values(issue), ensure_ascii=False)
     alerts = detect_issue_alerts(issue)
     questions = evening_check_questions(alerts)
     flags = classify_issue_flags(issue)
@@ -990,7 +1050,7 @@ def render_issue_card(issue: dict[str, Any], redmine_url: str) -> str:
     )
 
     return f"""
-        <article class="issue-card" data-assignee="{escape_text(assignee)}" data-participants="{escape_text(participants_json)}" data-version="{escape_text(version)}" data-is-closed="{str(is_closed_or_canceled(issue)).lower()}" data-overdue="{str(flags["overdue"]).lower()}" data-high-priority="{str(flags["high_priority"]).lower()}" data-stale="{str(flags["stale"]).lower()}">
+        <article class="issue-card" data-assignee="{escape_text(assignee)}" data-participants="{escape_text(participants_json)}" data-version="{escape_text(version)}" data-ball-possession="{escape_text(ball_possession_json)}" data-is-closed="{str(is_closed_or_canceled(issue)).lower()}" data-overdue="{str(flags["overdue"]).lower()}" data-high-priority="{str(flags["high_priority"]).lower()}" data-stale="{str(flags["stale"]).lower()}">
           <a class="issue-id" href="{escape_text(url)}" target="_blank" rel="noopener noreferrer">#{escape_text(issue_id)}</a>
 {labels_html}
           <h2>{escape_text(subject)}</h2>
@@ -1324,6 +1384,7 @@ def render_kanban_html(
     }}
 
     .assignee-filter,
+    .ball-possession-filter,
     .theme-filter {{
       display: grid;
       gap: 4px;
@@ -1333,6 +1394,7 @@ def render_kanban_html(
     }}
 
     .assignee-filter select,
+    .ball-possession-filter select,
     .theme-filter select {{
       width: 100%;
       min-height: 34px;
@@ -1476,6 +1538,25 @@ def render_kanban_html(
       overflow-y: hidden;
       white-space: nowrap;
       scrollbar-width: thin;
+    }}
+
+    .workload-assignee-button {{
+      display: inline;
+      min-width: 0;
+      max-width: 100%;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+    }}
+
+    .workload-assignee-button:hover,
+    .workload-assignee-button:focus-visible {{
+      text-decoration: underline;
+      text-underline-offset: 3px;
     }}
 
     .workload-card header > span {{
@@ -1830,14 +1911,19 @@ def render_kanban_html(
   </main>
   <script>
     const THEME_STORAGE_KEY = "redmine-kanban-theme";
+    const PROJECT_ID_HISTORY_STORAGE_KEY = "redmine-kanban-project-id-history";
+    const PROJECT_ID_HISTORY_LIMIT = 20;
     const themeSelector = document.getElementById("theme-selector");
     const assigneeFilter = document.getElementById("assignee-filter");
+    const ballPossessionFilter = document.getElementById("ball-possession-filter");
     const versionAll = document.getElementById("version-all");
     const versionCheckboxes = Array.from(document.querySelectorAll(".version-checkbox"));
     const resetFiltersButton = document.getElementById("reset-filters");
     const visibleIssueCount = document.getElementById("visible-issue-count");
     const workloadGrid = document.getElementById("workload-grid");
     const projectControl = document.querySelector(".project-control");
+    const projectIdInput = document.getElementById("project-id-input");
+    const projectIdHistory = document.getElementById("project-id-history");
     const refreshStatus = document.getElementById("refresh-status");
 
     function getSavedTheme() {{
@@ -1866,6 +1952,65 @@ def render_kanban_html(
       }});
     }}
 
+    function loadProjectIdHistory() {{
+      try {{
+        const parsed = JSON.parse(localStorage.getItem(PROJECT_ID_HISTORY_STORAGE_KEY) || "[]");
+        if (Array.isArray(parsed)) {{
+          return parsed
+            .filter((value) => typeof value === "string" && value.trim())
+            .slice(0, PROJECT_ID_HISTORY_LIMIT);
+        }}
+      }} catch {{
+        return [];
+      }}
+      return [];
+    }}
+
+    function saveProjectIdHistory(history) {{
+      localStorage.setItem(
+        PROJECT_ID_HISTORY_STORAGE_KEY,
+        JSON.stringify(history.slice(0, PROJECT_ID_HISTORY_LIMIT)),
+      );
+    }}
+
+    function renderProjectIdHistory(history) {{
+      if (!projectIdHistory) {{
+        return;
+      }}
+
+      const options = history.map((projectId) => {{
+        const option = document.createElement("option");
+        option.value = projectId;
+        return option;
+      }});
+      projectIdHistory.replaceChildren(...options);
+    }}
+
+    function rememberProjectId(projectId) {{
+      const normalizedProjectId = projectId.trim();
+      if (!normalizedProjectId) {{
+        return;
+      }}
+
+      const history = loadProjectIdHistory().filter((value) => value !== normalizedProjectId);
+      history.unshift(normalizedProjectId);
+      saveProjectIdHistory(history);
+      renderProjectIdHistory(history);
+    }}
+
+    function initializeProjectIdHistory() {{
+      if (!projectIdInput || !projectIdHistory) {{
+        return;
+      }}
+
+      renderProjectIdHistory(loadProjectIdHistory());
+      rememberProjectId(projectIdInput.value);
+      projectIdInput.addEventListener("change", () => rememberProjectId(projectIdInput.value));
+      if (projectControl) {{
+        projectControl.addEventListener("submit", () => rememberProjectId(projectIdInput.value));
+      }}
+    }}
+
     function getSelectedVersions() {{
       if (versionAll.checked) {{
         return null;
@@ -1884,6 +2029,18 @@ def render_kanban_html(
         return [card.dataset.assignee || "未設定"];
       }}
       return [card.dataset.assignee || "未設定"];
+    }}
+
+    function cardBallPossessionValues(card) {{
+      try {{
+        const values = JSON.parse(card.dataset.ballPossession || "[]");
+        if (Array.isArray(values)) {{
+          return values;
+        }}
+      }} catch {{
+        return [];
+      }}
+      return [];
     }}
 
     function workloadLevel(openIssueCount) {{
@@ -1943,7 +2100,16 @@ def render_kanban_html(
       const header = document.createElement("header");
       const title = document.createElement("h2");
       const badge = document.createElement("span");
-      title.textContent = item.assignee;
+      if (item.isTotal) {{
+        title.textContent = item.assignee;
+      }} else {{
+        const filterButton = document.createElement("button");
+        filterButton.type = "button";
+        filterButton.className = "workload-assignee-button";
+        filterButton.dataset.assignee = item.assignee;
+        filterButton.textContent = item.assignee;
+        title.append(filterButton);
+      }}
       badge.textContent = levelLabel;
       header.append(title);
       if (!item.isTotal) {{
@@ -2033,6 +2199,7 @@ def render_kanban_html(
 
     function applyFilters() {{
       const selectedAssignee = assigneeFilter.value;
+      const selectedBallPossession = ballPossessionFilter ? ballPossessionFilter.value : "__all__";
       const selectedVersions = getSelectedVersions();
       let visibleTotal = 0;
       const visibleCards = [];
@@ -2043,7 +2210,8 @@ def render_kanban_html(
         column.querySelectorAll(".issue-card").forEach((card) => {{
           const assigneeMatches = selectedAssignee === "__all__" || cardParticipants(card).includes(selectedAssignee);
           const versionMatches = selectedVersions === null || selectedVersions.has(card.dataset.version);
-          const matches = assigneeMatches && versionMatches;
+          const ballPossessionMatches = selectedBallPossession === "__all__" || cardBallPossessionValues(card).includes(selectedBallPossession);
+          const matches = assigneeMatches && versionMatches && ballPossessionMatches;
           card.classList.toggle("is-hidden", !matches);
           if (matches) {{
             columnVisibleCount += 1;
@@ -2057,6 +2225,31 @@ def render_kanban_html(
 
       visibleIssueCount.textContent = visibleTotal;
       updateWorkloadSummary(visibleCards);
+    }}
+
+    function selectAssigneeFilter(assignee) {{
+      const hasOption = Array.from(assigneeFilter.options).some((option) => option.value === assignee);
+      if (!hasOption) {{
+        return;
+      }}
+
+      assigneeFilter.value = assignee;
+      applyFilters();
+    }}
+
+    function initializeWorkloadAssigneeFilter() {{
+      if (!workloadGrid) {{
+        return;
+      }}
+
+      workloadGrid.addEventListener("click", (event) => {{
+        const button = event.target.closest(".workload-assignee-button");
+        if (!button || !workloadGrid.contains(button)) {{
+          return;
+        }}
+
+        selectAssigneeFilter(button.dataset.assignee || "");
+      }});
     }}
 
     function handleVersionAllChange() {{
@@ -2083,6 +2276,9 @@ def render_kanban_html(
 
     function resetFilters() {{
       assigneeFilter.value = "__all__";
+      if (ballPossessionFilter) {{
+        ballPossessionFilter.value = "__all__";
+      }}
       versionAll.checked = true;
       versionCheckboxes.forEach((checkbox) => {{
         checkbox.checked = false;
@@ -2113,10 +2309,15 @@ def render_kanban_html(
     }}
 
     assigneeFilter.addEventListener("change", applyFilters);
+    if (ballPossessionFilter) {{
+      ballPossessionFilter.addEventListener("change", applyFilters);
+    }}
     versionAll.addEventListener("change", handleVersionAllChange);
     versionCheckboxes.forEach((checkbox) => checkbox.addEventListener("change", handleVersionCheckboxChange));
     resetFiltersButton.addEventListener("click", resetFilters);
     initializeThemeSelector();
+    initializeProjectIdHistory();
+    initializeWorkloadAssigneeFilter();
     initializeRefreshStatus();
     applyFilters();
   </script>
