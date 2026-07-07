@@ -9,6 +9,8 @@ __pycache__/
 venv/
 env/
 kanban.html
+workload.html
+combined.html
 output/
 logs/
 .DS_Store

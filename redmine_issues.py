@@ -5,6 +5,7 @@ import html
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from argparse import ArgumentParser
@@ -35,6 +36,8 @@ SUB_ASSIGNEE_FIELD_NAME = "副担当者"
 SUB_ASSIGNEE_CACHE_FIELD = "_sub_assignees"
 BALL_POSSESSION_FIELD_NAME = "ボール所持"
 OUTPUT_HTML = "kanban.html"
+WORKLOAD_HTML = "workload.html"
+COMBINED_HTML = "combined.html"
 CACHE_DIR = Path(".cache")
 CACHE_SCHEMA_VERSION = 1
 DEFAULT_SERVE_HOST = "127.0.0.1"
@@ -118,6 +121,10 @@ def escape_text(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
+def script_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False).replace("<", "\\u003c")
+
+
 def parse_date(value: Any) -> date | None:
     if not value:
         return None
@@ -164,6 +171,16 @@ def user_reference_name(value: Any) -> str | None:
     name = value.get("name")
     if name:
         return str(name)
+    full_name = " ".join(
+        str(part).strip()
+        for part in (value.get("firstname"), value.get("lastname"))
+        if str(part or "").strip()
+    )
+    if full_name:
+        return full_name
+    login = value.get("login")
+    if login:
+        return str(login)
     return None
 
 
@@ -291,6 +308,29 @@ def format_remaining_work_time(value: str) -> str:
     if cleaned.endswith(("時間", "h", "H")):
         return cleaned
     return f"{cleaned}時間"
+
+
+def remaining_work_hours(issue: dict[str, Any]) -> float:
+    value = remaining_work_time(issue)
+    if value == "-":
+        return 0.0
+
+    match = re.search(r"\d+(?:\.\d+)?", value)
+    if not match:
+        return 0.0
+
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return 0.0
+
+
+def format_hours(value: float) -> str:
+    if value <= 0:
+        return "-"
+    if value.is_integer():
+        return f"{int(value)}h"
+    return f"{value:.1f}h"
 
 
 def is_closed_or_canceled(issue: dict[str, Any]) -> bool:
@@ -546,8 +586,7 @@ def fetch_user_name(redmine_url: str, api_key: str, user_id: str) -> str | None:
     if not isinstance(user, dict):
         return None
 
-    name = user.get("name")
-    return str(name) if name else None
+    return user_reference_name(user)
 
 
 def attach_sub_assignee_names(
@@ -895,6 +934,8 @@ def render_project_control(project_id: str) -> str:
           <button type="submit">表示</button>
           <button type="submit" name="refresh_mode" value="incremental" formmethod="post" formaction="/refresh">更新</button>
           <button type="submit" name="refresh_mode" value="full" formmethod="post" formaction="/refresh">全更新</button>
+          <a class="control-link" href="/{WORKLOAD_HTML}" target="_top">作業負荷状況</a>
+          <a class="control-link" href="/{COMBINED_HTML}" target="_top">同時表示</a>
           <span class="refresh-status" id="refresh-status" role="status" aria-live="polite"></span>
         </form>"""
 
@@ -1064,6 +1105,1191 @@ def render_issue_card(issue: dict[str, Any], redmine_url: str) -> str:
 {questions_html}
 {time_entry_comment_html}
         </article>"""
+
+
+def workload_level_by_score(score: float) -> tuple[str, str]:
+    if score >= 8:
+        return "高負荷", "high"
+    if score >= 4:
+        return "注意", "warning"
+    return "通常", "normal"
+
+
+def workload_balance_class(value: float, max_value: float) -> str:
+    if value <= 0 or max_value <= 0:
+        return "balance-empty"
+    ratio = value / max_value
+    if ratio >= 0.75:
+        return "balance-high"
+    if ratio >= 0.4:
+        return "balance-medium"
+    return "balance-low"
+
+
+def workload_issue_summary(
+    issue: dict[str, Any], redmine_url: str, role: str, remaining_hours: float
+) -> dict[str, Any]:
+    flags = classify_issue_flags(issue)
+    return {
+        "id": issue.get("id", "-"),
+        "url": issue_url(issue, redmine_url),
+        "subject": issue.get("subject") or "-",
+        "role": role,
+        "status": issue_field(issue, "status"),
+        "priority": issue_field(issue, "priority"),
+        "due_date": issue.get("due_date") or "-",
+        "updated_on": issue.get("updated_on") or "-",
+        "remaining_hours": remaining_hours,
+        "overdue": flags["overdue"],
+        "high_priority": flags["high_priority"],
+        "stale": flags["stale"],
+    }
+
+
+def calculate_workload_dashboard(
+    issues: list[dict[str, Any]], redmine_url: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    people: dict[str, dict[str, Any]] = {}
+    open_issues = [issue for issue in issues if not is_closed_or_canceled(issue)]
+
+    for issue in open_issues:
+        primary = assignee_name(issue)
+        sub_names = sub_assignee_names(issue)
+        participants = participant_names(issue)
+        flags = classify_issue_flags(issue)
+        remaining_hours = remaining_work_hours(issue)
+        assigned_remaining_hours = (
+            remaining_hours / len(participants)
+            if sub_names and participants
+            else remaining_hours
+        )
+
+        for name in participants:
+            role = "主担当" if name == primary else "副担当"
+            item = people.setdefault(
+                name,
+                {
+                    "assignee": name,
+                    "open_count": 0,
+                    "primary_count": 0,
+                    "sub_count": 0,
+                    "overdue_count": 0,
+                    "high_priority_count": 0,
+                    "stale_count": 0,
+                    "primary_remaining_hours": 0.0,
+                    "issues": [],
+                },
+            )
+            item["open_count"] += 1
+            item["primary_count"] += int(role == "主担当")
+            item["sub_count"] += int(role == "副担当")
+            item["overdue_count"] += int(flags["overdue"])
+            item["high_priority_count"] += int(flags["high_priority"])
+            item["stale_count"] += int(flags["stale"])
+            item["primary_remaining_hours"] += assigned_remaining_hours
+            item["issues"].append(
+                workload_issue_summary(issue, redmine_url, role, assigned_remaining_hours)
+            )
+
+        if not participants and not sub_names:
+            people.setdefault(
+                "未設定",
+                {
+                    "assignee": "未設定",
+                    "open_count": 0,
+                    "primary_count": 0,
+                    "sub_count": 0,
+                    "overdue_count": 0,
+                    "high_priority_count": 0,
+                    "stale_count": 0,
+                    "primary_remaining_hours": 0.0,
+                    "issues": [],
+                },
+            )
+
+    for item in people.values():
+        item["score"] = (
+            item["open_count"]
+            + item["overdue_count"] * 2
+            + item["high_priority_count"] * 2
+            + item["stale_count"]
+            + item["primary_remaining_hours"] / 8
+        )
+        level_label, level_class = workload_level_by_score(item["score"])
+        item["level_label"] = level_label
+        item["level_class"] = level_class
+        item["issues"].sort(
+            key=lambda issue: (
+                issue["role"] != "主担当",
+                not issue["overdue"],
+                not issue["high_priority"],
+                str(issue["due_date"]),
+                str(issue["id"]),
+            )
+        )
+
+    people_list = sorted(
+        people.values(),
+        key=lambda item: (-item["score"], -item["open_count"], item["assignee"]),
+    )
+    totals = {
+        "open_count": len(open_issues),
+        "person_count": len(people_list),
+        "high_load_count": sum(1 for item in people_list if item["level_class"] == "high"),
+        "overdue_count": sum(1 for issue in open_issues if classify_issue_flags(issue)["overdue"]),
+        "high_priority_count": sum(
+            1 for issue in open_issues if classify_issue_flags(issue)["high_priority"]
+        ),
+        "primary_remaining_hours": sum(remaining_work_hours(issue) for issue in open_issues),
+    }
+    return people_list, totals
+
+
+def render_workload_status_html(
+    issues: list[dict[str, Any]], redmine_url: str, project_id: str
+) -> str:
+    people, _totals = calculate_workload_dashboard(issues, redmine_url)
+    people_json = script_json(people)
+    max_values = {
+        "open_count": max([item["open_count"] for item in people] or [0]),
+        "overdue_count": max([item["overdue_count"] for item in people] or [0]),
+        "high_priority_count": max([item["high_priority_count"] for item in people] or [0]),
+        "stale_count": max([item["stale_count"] for item in people] or [0]),
+        "primary_remaining_hours": max(
+            [item["primary_remaining_hours"] for item in people] or [0]
+        ),
+        "score": max([item["score"] for item in people] or [0]),
+    }
+
+    selected_totals = {
+        "open_count": sum(item["open_count"] for item in people),
+        "person_count": len(people),
+        "high_load_count": sum(1 for item in people if item["level_class"] == "high"),
+        "overdue_count": sum(item["overdue_count"] for item in people),
+        "high_priority_count": sum(item["high_priority_count"] for item in people),
+        "primary_remaining_hours": sum(item["primary_remaining_hours"] for item in people),
+    }
+    stat_cards = [
+        ("open_count", "関与Issue", selected_totals["open_count"]),
+        ("person_count", "対象者", selected_totals["person_count"]),
+        ("high_load_count", "高負荷", selected_totals["high_load_count"]),
+        ("overdue_count", "期限超過", selected_totals["overdue_count"]),
+        ("high_priority_count", "高優先度", selected_totals["high_priority_count"]),
+        ("primary_remaining_hours", "残作業時間", format_hours(selected_totals["primary_remaining_hours"])),
+    ]
+    stat_cards_html = "\n".join(
+        f"""
+        <article class="stat-card">
+          <span>{escape_text(label)}</span>
+          <strong data-stat-key="{escape_text(key)}">{escape_text(value)}</strong>
+        </article>"""
+        for key, label, value in stat_cards
+    )
+
+    person_filter_options = "\n".join(
+        f"""
+          <label class="person-filter-option">
+            <input type="checkbox" class="person-filter-checkbox" value="{escape_text(item["assignee"])}" checked>
+            <span>{escape_text(item["assignee"])}</span>
+          </label>"""
+        for item in people
+    )
+
+    person_cards = []
+    for index, item in enumerate(people):
+        selected_class = " is-selected" if index == 0 else ""
+        person_cards.append(
+            f"""
+        <button type="button" class="person-card workload-{escape_text(item["level_class"])}{selected_class}" data-assignee="{escape_text(item["assignee"])}">
+          <span class="person-card-name">{escape_text(item["assignee"])}</span>
+          <span class="person-card-level">{escape_text(item["level_label"])}</span>
+          <span class="person-card-score">score {item["score"]:.1f}</span>
+          <span class="person-card-grid">
+            <span><b>{item["open_count"]}</b>関与</span>
+            <span><b>{item["primary_count"]}</b>主</span>
+            <span><b>{item["sub_count"]}</b>副</span>
+            <span><b>{format_hours(item["primary_remaining_hours"])}</b>残</span>
+          </span>
+        </button>"""
+        )
+
+    columns = [
+        ("open_count", "関与"),
+        ("primary_count", "主担当"),
+        ("sub_count", "副担当"),
+        ("overdue_count", "期限超過"),
+        ("high_priority_count", "高優先度"),
+        ("stale_count", "更新停滞"),
+        ("primary_remaining_hours", "残作業h"),
+        ("score", "スコア"),
+    ]
+    table_rows = []
+    for item in people:
+        cells = []
+        for key, label in columns:
+            value = item[key]
+            display_value = format_hours(value) if key == "primary_remaining_hours" else (
+                f"{value:.1f}" if key == "score" else str(value)
+            )
+            balance_class = workload_balance_class(float(value), float(max_values.get(key, 0)))
+            cells.append(
+                f'<td class="{balance_class}" data-label="{escape_text(label)}">{escape_text(display_value)}</td>'
+            )
+        table_rows.append(
+            f"""
+          <tr data-assignee="{escape_text(item["assignee"])}">
+            <th scope="row"><button type="button" class="table-assignee">{escape_text(item["assignee"])}</button></th>
+            {''.join(cells)}
+          </tr>"""
+        )
+
+    if not people:
+        person_cards_html = '<p class="empty-message">表示対象の未完了Issueはありません。</p>'
+        table_body_html = """
+          <tr>
+            <td colspan="9" class="empty-cell">表示対象の未完了Issueはありません。</td>
+          </tr>"""
+    else:
+        person_cards_html = "\n".join(person_cards)
+        table_body_html = "\n".join(table_rows)
+
+    return f"""<!doctype html>
+<html lang="ja" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>作業負荷状況 - Redmine Kanban</title>
+  <style>
+    * {{
+      box-sizing: border-box;
+    }}
+
+    :root {{
+      color-scheme: light;
+      --bg-color: #f6f7f9;
+      --text-color: #1f2937;
+      --muted-text: #64748b;
+      --panel-bg: #ffffff;
+      --panel-border: #d8dee8;
+      --button-bg: #374151;
+      --button-hover-bg: #111827;
+      --button-text: #ffffff;
+      --link-color: #0f766e;
+      --shadow-color: rgba(15, 23, 42, 0.08);
+      --high-bg: #fee2e2;
+      --high-text: #7f1d1d;
+      --high-border: #ef4444;
+      --warning-bg: #fef3c7;
+      --warning-text: #78350f;
+      --warning-border: #f59e0b;
+      --normal-bg: #dcfce7;
+      --normal-text: #14532d;
+      --low-bg: #e0f2fe;
+      --medium-bg: #fde68a;
+    }}
+
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        color-scheme: dark;
+        --bg-color: #0f172a;
+        --text-color: #e5e7eb;
+        --muted-text: #cbd5e1;
+        --panel-bg: #111827;
+        --panel-border: #374151;
+        --button-bg: #0f766e;
+        --button-hover-bg: #14b8a6;
+        --button-text: #ffffff;
+        --link-color: #5eead4;
+        --shadow-color: rgba(0, 0, 0, 0.35);
+        --high-bg: #7f1d1d;
+        --high-text: #fee2e2;
+        --high-border: #f87171;
+        --warning-bg: #713f12;
+        --warning-text: #fef3c7;
+        --warning-border: #fbbf24;
+        --normal-bg: #14532d;
+        --normal-text: #dcfce7;
+        --low-bg: #164e63;
+        --medium-bg: #713f12;
+      }}
+    }}
+
+    body {{
+      margin: 0;
+      color: var(--text-color);
+      background: var(--bg-color);
+      font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }}
+
+    .page-header {{
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      padding: 18px 24px;
+      background: color-mix(in srgb, var(--bg-color) 94%, transparent);
+      border-bottom: 1px solid var(--panel-border);
+      backdrop-filter: blur(10px);
+    }}
+
+    .page-header h1 {{
+      margin: 0 0 4px;
+      font-size: 24px;
+      letter-spacing: 0;
+    }}
+
+    .page-header p {{
+      margin: 0;
+      color: var(--muted-text);
+      font-size: 13px;
+    }}
+
+    .header-actions {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }}
+
+    .button {{
+      display: inline-flex;
+      min-height: 36px;
+      align-items: center;
+      justify-content: center;
+      padding: 8px 12px;
+      color: var(--button-text);
+      background: var(--button-bg);
+      border-radius: 8px;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 700;
+    }}
+
+    .button:hover {{
+      background: var(--button-hover-bg);
+    }}
+
+    main {{
+      display: grid;
+      gap: 16px;
+      padding: 18px 24px 28px;
+    }}
+
+    .summary-grid {{
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 10px;
+    }}
+
+    .people-filter {{
+      padding: 14px 16px;
+    }}
+
+    .people-filter-header {{
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }}
+
+    .people-filter-header h2 {{
+      margin: 0;
+      font-size: 16px;
+    }}
+
+    .people-filter-actions {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }}
+
+    .filter-action-button {{
+      min-height: 32px;
+      padding: 6px 10px;
+      color: var(--button-text);
+      background: var(--button-bg);
+      border: 1px solid var(--button-bg);
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .filter-action-button:hover {{
+      background: var(--button-hover-bg);
+    }}
+
+    .person-filter-options {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+
+    .person-filter-option {{
+      display: inline-flex;
+      min-height: 34px;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border: 1px solid var(--panel-border);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel-bg) 86%, var(--low-bg));
+      font-size: 13px;
+      font-weight: 700;
+    }}
+
+    .person-filter-option input {{
+      width: 16px;
+      height: 16px;
+      margin: 0;
+    }}
+
+    .stat-card,
+    .panel {{
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      box-shadow: 0 1px 2px var(--shadow-color);
+    }}
+
+    .stat-card {{
+      min-height: 76px;
+      padding: 12px;
+      border-radius: 8px;
+    }}
+
+    .stat-card span {{
+      display: block;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 700;
+    }}
+
+    .stat-card strong {{
+      display: block;
+      margin-top: 8px;
+      font-size: 24px;
+      line-height: 1;
+    }}
+
+    .dashboard-layout {{
+      display: grid;
+      grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }}
+
+    .panel {{
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+
+    .panel-header {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--panel-border);
+    }}
+
+    .panel-header h2 {{
+      margin: 0;
+      font-size: 16px;
+    }}
+
+    .panel-header p {{
+      margin: 0;
+      color: var(--muted-text);
+      font-size: 12px;
+    }}
+
+    .person-list {{
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+      max-height: calc(100vh - 240px);
+      overflow: auto;
+    }}
+
+    .person-card {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      width: 100%;
+      min-height: 96px;
+      padding: 12px;
+      color: var(--text-color);
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      border-left-width: 5px;
+      border-radius: 8px;
+      cursor: pointer;
+      text-align: left;
+    }}
+
+    .person-card.is-selected {{
+      outline: 2px solid var(--link-color);
+      outline-offset: 1px;
+    }}
+
+    .is-filter-hidden {{
+      display: none;
+    }}
+
+    .person-card-name {{
+      overflow-wrap: anywhere;
+      font-weight: 800;
+    }}
+
+    .person-card-level {{
+      align-self: start;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .person-card-score {{
+      color: var(--muted-text);
+      font-size: 12px;
+    }}
+
+    .person-card-grid {{
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 6px;
+      font-size: 12px;
+    }}
+
+    .person-card-grid span {{
+      padding: 6px;
+      background: color-mix(in srgb, var(--panel-border) 24%, transparent);
+      border-radius: 6px;
+    }}
+
+    .workload-high {{
+      border-left-color: var(--high-border);
+    }}
+
+    .workload-high .person-card-level {{
+      color: var(--high-text);
+      background: var(--high-bg);
+    }}
+
+    .workload-warning {{
+      border-left-color: var(--warning-border);
+    }}
+
+    .workload-warning .person-card-level {{
+      color: var(--warning-text);
+      background: var(--warning-bg);
+    }}
+
+    .workload-normal {{
+      border-left-color: #22c55e;
+    }}
+
+    .workload-normal .person-card-level {{
+      color: var(--normal-text);
+      background: var(--normal-bg);
+    }}
+
+    .table-wrap {{
+      overflow: auto;
+    }}
+
+    table {{
+      width: 100%;
+      min-width: 860px;
+      border-collapse: collapse;
+    }}
+
+    th,
+    td {{
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--panel-border);
+      text-align: right;
+      font-size: 13px;
+      white-space: nowrap;
+    }}
+
+    th {{
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    tbody th {{
+      text-align: left;
+    }}
+
+    .table-assignee {{
+      padding: 0;
+      color: var(--link-color);
+      background: none;
+      border: 0;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 800;
+    }}
+
+    .balance-empty {{
+      color: var(--muted-text);
+    }}
+
+    .balance-low {{
+      background: color-mix(in srgb, var(--low-bg) 40%, transparent);
+    }}
+
+    .balance-medium {{
+      background: color-mix(in srgb, var(--medium-bg) 55%, transparent);
+    }}
+
+    .balance-high {{
+      background: color-mix(in srgb, var(--high-bg) 76%, transparent);
+      color: var(--high-text);
+      font-weight: 800;
+    }}
+
+    .detail-body {{
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+    }}
+
+    .issue-row {{
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) repeat(4, auto);
+      gap: 10px;
+      align-items: center;
+      min-height: 48px;
+      padding: 10px 12px;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+    }}
+
+    .issue-row a {{
+      color: var(--link-color);
+      font-weight: 800;
+      text-decoration: none;
+    }}
+
+    .issue-subject {{
+      overflow-wrap: anywhere;
+      font-weight: 700;
+    }}
+
+    .chip {{
+      padding: 4px 7px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel-border) 28%, transparent);
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+
+    .chip-alert {{
+      color: var(--high-text);
+      background: var(--high-bg);
+    }}
+
+    .empty-message,
+    .empty-cell {{
+      padding: 18px;
+      color: var(--muted-text);
+      text-align: center;
+    }}
+
+    @media (max-width: 980px) {{
+      .page-header,
+      .dashboard-layout {{
+        grid-template-columns: 1fr;
+      }}
+
+      .page-header {{
+        display: grid;
+      }}
+
+      .summary-grid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+
+      .person-list {{
+        max-height: none;
+      }}
+
+      .issue-row {{
+        grid-template-columns: auto minmax(0, 1fr);
+      }}
+
+      .issue-row .chip {{
+        justify-self: start;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <header class="page-header">
+    <div>
+      <h1>作業負荷状況</h1>
+      <p>PROJECT_ID: {escape_text(project_id)} / 主担当と副担当を含めた関与状況</p>
+    </div>
+    <div class="header-actions">
+      <a class="button" href="/{OUTPUT_HTML}" target="_top">かんばんボード</a>
+      <a class="button" href="/{COMBINED_HTML}" target="_top">同時表示</a>
+      <a class="button" href="/{WORKLOAD_HTML}" target="_top">再読み込み</a>
+    </div>
+  </header>
+  <main>
+    <section class="summary-grid" aria-label="全体サマリー">
+{stat_cards_html}
+    </section>
+    <section class="panel people-filter" aria-label="担当者フィルタ">
+      <div class="people-filter-header">
+        <h2>担当者フィルタ</h2>
+        <div class="people-filter-actions">
+          <button type="button" class="filter-action-button" id="select-all-people">全選択</button>
+          <button type="button" class="filter-action-button" id="clear-people">解除</button>
+        </div>
+      </div>
+      <div class="person-filter-options" id="person-filter-options">
+{person_filter_options}
+      </div>
+    </section>
+    <section class="dashboard-layout">
+      <aside class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>担当者別</h2>
+            <p>スコア順</p>
+          </div>
+        </div>
+        <div class="person-list" id="person-list">
+{person_cards_html}
+        </div>
+      </aside>
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>負荷バランス表</h2>
+            <p>濃いセルほど偏りが大きい指標です</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">担当者</th>
+                {''.join(f'<th scope="col">{escape_text(label)}</th>' for _, label in columns)}
+              </tr>
+            </thead>
+            <tbody>
+{table_body_html}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+    <section class="panel" id="detail-panel">
+      <div class="panel-header">
+        <div>
+          <h2 id="detail-title">担当者詳細</h2>
+          <p id="detail-summary">担当者を選択するとIssue一覧を表示します</p>
+        </div>
+      </div>
+      <div class="detail-body" id="detail-body"></div>
+    </section>
+  </main>
+  <script type="application/json" id="workload-data">{people_json}</script>
+  <script>
+    const people = JSON.parse(document.getElementById("workload-data").textContent || "[]");
+    const projectId = {script_json(project_id)};
+    const WORKLOAD_PEOPLE_STORAGE_KEY = `redmine-kanban-workload-people:${{projectId}}`;
+    const personList = document.getElementById("person-list");
+    const filterCheckboxes = Array.from(document.querySelectorAll(".person-filter-checkbox"));
+    const selectAllPeopleButton = document.getElementById("select-all-people");
+    const clearPeopleButton = document.getElementById("clear-people");
+    const detailTitle = document.getElementById("detail-title");
+    const detailSummary = document.getElementById("detail-summary");
+    const detailBody = document.getElementById("detail-body");
+
+    function formatHours(value) {{
+      if (!value || value <= 0) {{
+        return "-";
+      }}
+      return Number.isInteger(value) ? `${{value}}h` : `${{value.toFixed(1)}}h`;
+    }}
+
+    function selectedAssignees() {{
+      return new Set(filterCheckboxes.filter((checkbox) => checkbox.checked).map((checkbox) => checkbox.value));
+    }}
+
+    function loadSavedAssignees() {{
+      try {{
+        const parsed = JSON.parse(localStorage.getItem(WORKLOAD_PEOPLE_STORAGE_KEY) || "null");
+        return Array.isArray(parsed) ? new Set(parsed.map((value) => String(value))) : null;
+      }} catch {{
+        return null;
+      }}
+    }}
+
+    function saveSelectedAssignees() {{
+      try {{
+        localStorage.setItem(WORKLOAD_PEOPLE_STORAGE_KEY, JSON.stringify(Array.from(selectedAssignees())));
+      }} catch {{
+      }}
+    }}
+
+    function applySavedAssignees() {{
+      const saved = loadSavedAssignees();
+      if (saved === null) {{
+        return;
+      }}
+
+      filterCheckboxes.forEach((checkbox) => {{
+        checkbox.checked = saved.has(checkbox.value);
+      }});
+    }}
+
+    function filteredPeople() {{
+      const selected = selectedAssignees();
+      return people.filter((person) => selected.has(person.assignee));
+    }}
+
+    function updateStat(key, value) {{
+      const target = document.querySelector(`[data-stat-key="${{key}}"]`);
+      if (target) {{
+        target.textContent = value;
+      }}
+    }}
+
+    function updateSummary(selectedPeople) {{
+      updateStat("open_count", selectedPeople.reduce((total, person) => total + person.open_count, 0));
+      updateStat("person_count", selectedPeople.length);
+      updateStat("high_load_count", selectedPeople.filter((person) => person.level_class === "high").length);
+      updateStat("overdue_count", selectedPeople.reduce((total, person) => total + person.overdue_count, 0));
+      updateStat("high_priority_count", selectedPeople.reduce((total, person) => total + person.high_priority_count, 0));
+      updateStat("primary_remaining_hours", formatHours(selectedPeople.reduce((total, person) => total + person.primary_remaining_hours, 0)));
+    }}
+
+    function showEmptyDetail() {{
+      detailTitle.textContent = "担当者詳細";
+      detailSummary.textContent = "担当者を選択するとIssue一覧を表示します";
+      detailBody.replaceChildren();
+      const empty = document.createElement("p");
+      empty.className = "empty-message";
+      empty.textContent = "担当者が選択されていません。";
+      detailBody.append(empty);
+    }}
+
+    function selectAssignee(assignee) {{
+      const person = people.find((item) => item.assignee === assignee);
+      if (!person) {{
+        return;
+      }}
+
+      document.querySelectorAll("[data-assignee]").forEach((element) => {{
+        element.classList.toggle("is-selected", element.dataset.assignee === assignee);
+      }});
+
+      detailTitle.textContent = `${{person.assignee}} のIssue`;
+      detailSummary.textContent = `関与 ${{person.open_count}}件 / 主担当 ${{person.primary_count}}件 / 副担当 ${{person.sub_count}}件 / 案分残作業 ${{formatHours(person.primary_remaining_hours)}}`;
+      detailBody.replaceChildren();
+
+      if (!person.issues.length) {{
+        const empty = document.createElement("p");
+        empty.className = "empty-message";
+        empty.textContent = "表示対象のIssueはありません。";
+        detailBody.append(empty);
+        return;
+      }}
+
+      person.issues.forEach((issue) => {{
+        const row = document.createElement("article");
+        row.className = "issue-row";
+
+        const id = document.createElement("a");
+        id.href = issue.url;
+        id.target = "_blank";
+        id.rel = "noopener noreferrer";
+        id.textContent = `#${{issue.id}}`;
+
+        const subject = document.createElement("span");
+        subject.className = "issue-subject";
+        subject.textContent = issue.subject;
+
+        const role = document.createElement("span");
+        role.className = "chip";
+        role.textContent = issue.role;
+
+        const status = document.createElement("span");
+        status.className = "chip";
+        status.textContent = issue.status;
+
+        const due = document.createElement("span");
+        due.className = issue.overdue ? "chip chip-alert" : "chip";
+        due.textContent = issue.due_date === "-" ? "期日 -" : `期日 ${{issue.due_date}}`;
+
+        const remaining = document.createElement("span");
+        remaining.className = "chip";
+        remaining.textContent = `残 ${{formatHours(issue.remaining_hours)}}`;
+
+        row.append(id, subject, role, status, due, remaining);
+        detailBody.append(row);
+      }});
+    }}
+
+    function applyPeopleFilter() {{
+      saveSelectedAssignees();
+      const selected = selectedAssignees();
+      const selectedPeople = filteredPeople();
+      updateSummary(selectedPeople);
+
+      document.querySelectorAll(".person-card").forEach((card) => {{
+        card.classList.toggle("is-filter-hidden", !selected.has(card.dataset.assignee || ""));
+      }});
+
+      document.querySelectorAll("tbody tr[data-assignee]").forEach((row) => {{
+        row.classList.toggle("is-filter-hidden", !selected.has(row.dataset.assignee || ""));
+      }});
+
+      const selectedCard = document.querySelector(".person-card.is-selected:not(.is-filter-hidden)");
+      if (selectedCard) {{
+        selectAssignee(selectedCard.dataset.assignee || "");
+      }} else if (selectedPeople.length) {{
+        selectAssignee(selectedPeople[0].assignee);
+      }} else {{
+        document.querySelectorAll("[data-assignee]").forEach((element) => element.classList.remove("is-selected"));
+        showEmptyDetail();
+      }}
+    }}
+
+    personList.addEventListener("click", (event) => {{
+      const button = event.target.closest(".person-card");
+      if (button) {{
+        selectAssignee(button.dataset.assignee || "");
+      }}
+    }});
+
+    document.querySelector("tbody").addEventListener("click", (event) => {{
+      const button = event.target.closest(".table-assignee");
+      if (button) {{
+        selectAssignee(button.closest("tr").dataset.assignee || "");
+      }}
+    }});
+
+    filterCheckboxes.forEach((checkbox) => checkbox.addEventListener("change", applyPeopleFilter));
+    selectAllPeopleButton.addEventListener("click", () => {{
+      filterCheckboxes.forEach((checkbox) => {{
+        checkbox.checked = true;
+      }});
+      applyPeopleFilter();
+    }});
+    clearPeopleButton.addEventListener("click", () => {{
+      filterCheckboxes.forEach((checkbox) => {{
+        checkbox.checked = false;
+      }});
+      applyPeopleFilter();
+    }});
+
+    applySavedAssignees();
+    if (people.length) {{
+      applyPeopleFilter();
+    }} else {{
+      showEmptyDetail();
+    }}
+  </script>
+</body>
+</html>
+"""
+
+
+def render_combined_html(project_id: str) -> str:
+    return f"""<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>同時表示 - Redmine Kanban</title>
+  <style>
+    * {{
+      box-sizing: border-box;
+    }}
+
+    :root {{
+      color-scheme: light;
+      --bg-color: #f3f4f6;
+      --text-color: #1f2937;
+      --muted-text: #64748b;
+      --panel-border: #cbd5e1;
+      --button-bg: #374151;
+      --button-hover-bg: #111827;
+      --button-text: #ffffff;
+    }}
+
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        color-scheme: dark;
+        --bg-color: #0f172a;
+        --text-color: #e5e7eb;
+        --muted-text: #cbd5e1;
+        --panel-border: #374151;
+        --button-bg: #0f766e;
+        --button-hover-bg: #14b8a6;
+        --button-text: #ffffff;
+      }}
+    }}
+
+    html,
+    body {{
+      width: 100%;
+      height: 100%;
+      margin: 0;
+    }}
+
+    body {{
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      color: var(--text-color);
+      background: var(--bg-color);
+      font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }}
+
+    .combined-header {{
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--panel-border);
+    }}
+
+    .combined-header h1 {{
+      margin: 0;
+      font-size: 17px;
+      letter-spacing: 0;
+    }}
+
+    .combined-header p {{
+      margin: 2px 0 0;
+      color: var(--muted-text);
+      font-size: 12px;
+    }}
+
+    .combined-actions {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }}
+
+    .button {{
+      display: inline-flex;
+      min-height: 32px;
+      align-items: center;
+      justify-content: center;
+      padding: 6px 10px;
+      color: var(--button-text);
+      background: var(--button-bg);
+      border-radius: 8px;
+      text-decoration: none;
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }}
+
+    .button:hover {{
+      background: var(--button-hover-bg);
+    }}
+
+    .combined-layout {{
+      display: grid;
+      grid-template-columns: minmax(420px, 1.2fr) minmax(420px, 1fr);
+      min-height: 0;
+    }}
+
+    .pane {{
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      min-width: 0;
+      min-height: 0;
+      border-right: 1px solid var(--panel-border);
+    }}
+
+    .pane:last-child {{
+      border-right: 0;
+    }}
+
+    .pane-title {{
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--panel-border);
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    iframe {{
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: var(--bg-color);
+    }}
+
+    @media (max-width: 980px) {{
+      body {{
+        height: auto;
+        min-height: 100%;
+      }}
+
+      .combined-header {{
+        display: grid;
+      }}
+
+      .combined-layout {{
+        grid-template-columns: 1fr;
+      }}
+
+      .pane {{
+        height: 80vh;
+        border-right: 0;
+        border-bottom: 1px solid var(--panel-border);
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <header class="combined-header">
+    <div>
+      <h1>かんばん・作業負荷 同時表示</h1>
+      <p>PROJECT_ID: {escape_text(project_id)}</p>
+    </div>
+    <nav class="combined-actions" aria-label="画面切り替え">
+      <a class="button" href="/{OUTPUT_HTML}">かんばん</a>
+      <a class="button" href="/{WORKLOAD_HTML}">作業負荷状況</a>
+      <a class="button" href="/{COMBINED_HTML}">再読み込み</a>
+    </nav>
+  </header>
+  <main class="combined-layout">
+    <section class="pane">
+      <div class="pane-title">かんばんボード</div>
+      <iframe title="かんばんボード" src="/{OUTPUT_HTML}"></iframe>
+    </section>
+    <section class="pane">
+      <div class="pane-title">作業負荷状況</div>
+      <iframe title="作業負荷状況" src="/{WORKLOAD_HTML}"></iframe>
+    </section>
+  </main>
+</body>
+</html>
+"""
 
 
 def render_kanban_html(
@@ -1435,7 +2661,11 @@ def render_kanban_html(
       background: rgba(239, 68, 68, 0.18);
     }}
 
-    .project-control button {{
+    .project-control button,
+    .project-control .control-link {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       min-height: 34px;
       padding: 7px 12px;
       color: var(--button-text);
@@ -1446,10 +2676,12 @@ def render_kanban_html(
       font-size: 12px;
       font-weight: 800;
       cursor: pointer;
+      text-decoration: none;
       white-space: nowrap;
     }}
 
-    .project-control button:hover {{
+    .project-control button:hover,
+    .project-control .control-link:hover {{
       background: var(--button-hover-bg);
     }}
 
@@ -2533,6 +3765,12 @@ def write_kanban_html(
     output_path.write_text(
         render_kanban_html(issues, redmine_url, project_id), encoding="utf-8"
     )
+    workload_path = Path(WORKLOAD_HTML).resolve()
+    workload_path.write_text(
+        render_workload_status_html(issues, redmine_url, project_id), encoding="utf-8"
+    )
+    combined_path = Path(COMBINED_HTML).resolve()
+    combined_path.write_text(render_combined_html(project_id), encoding="utf-8")
     return output_path
 
 
@@ -2622,7 +3860,12 @@ def ensure_issue_cache_loaded_from_disk(project_id: str) -> bool:
     if cache_entry is None:
         return False
 
-    attach_sub_assignee_names(cache_entry.issues)
+    if env_flag("USE_SAMPLE_DATA"):
+        attach_sub_assignee_names(cache_entry.issues)
+    else:
+        load_env()
+        api_key = os.getenv("REDMINE_API_KEY")
+        attach_sub_assignee_names(cache_entry.issues, cache_entry.redmine_url, api_key)
 
     with ISSUE_CACHE_LOCK:
         ISSUE_CACHE.setdefault(project_id, cache_entry)
@@ -2904,9 +4147,9 @@ def render_error_html(message: str) -> str:
 """
 
 
-def render_loading_html(project_id: str | None) -> str:
+def render_loading_html(project_id: str | None, reload_path: str = OUTPUT_HTML) -> str:
     project_id_value = project_id or resolve_project_id(None)
-    reload_url = f"/{OUTPUT_HTML}"
+    reload_url = f"/{reload_path}"
     reload_url_json = json.dumps(reload_url)
     return f"""<!doctype html>
 <html lang="ja" data-theme="system">
@@ -3021,16 +4264,23 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if parsed_url.path not in {"/", f"/{OUTPUT_HTML}"}:
+        if parsed_url.path not in {"/", f"/{OUTPUT_HTML}", f"/{WORKLOAD_HTML}", f"/{COMBINED_HTML}"}:
             self.send_error(404, "Not Found")
             return
+
+        if parsed_url.path == f"/{WORKLOAD_HTML}":
+            response_path = WORKLOAD_HTML
+        elif parsed_url.path == f"/{COMBINED_HTML}":
+            response_path = COMBINED_HTML
+        else:
+            response_path = OUTPUT_HTML
 
         query = parse_qs(parsed_url.query)
         query_project_id = request_project_id(query)
         if query_project_id:
             resolved_project_id = resolve_project_id(query_project_id)
             self.send_response(303)
-            self.send_header("Location", f"/{OUTPUT_HTML}")
+            self.send_header("Location", f"/{response_path}")
             self.send_header("Set-Cookie", project_id_cookie_header(resolved_project_id))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -3058,7 +4308,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                     return
 
                 start_background_refresh(resolved_project_id)
-                response_body = render_loading_html(resolved_project_id)
+                response_body = render_loading_html(resolved_project_id, response_path)
                 status_code = 200
                 encoded_body = response_body.encode("utf-8")
                 self.send_response(status_code)
@@ -3075,9 +4325,16 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                 refresh_mode="incremental",
                 once_per_startup=True,
             )
-            response_body = render_kanban_html(
-                visible_issues, redmine_url, resolved_project_id
-            )
+            if response_path == WORKLOAD_HTML:
+                response_body = render_workload_status_html(
+                    visible_issues, redmine_url, resolved_project_id
+                )
+            elif response_path == COMBINED_HTML:
+                response_body = render_combined_html(resolved_project_id)
+            else:
+                response_body = render_kanban_html(
+                    visible_issues, redmine_url, resolved_project_id
+                )
             status_code = 200
         except (ValueError, RuntimeError) as exc:
             response_body = render_error_html(str(exc))
