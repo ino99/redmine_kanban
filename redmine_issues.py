@@ -2343,14 +2343,15 @@ def render_kanban_html(
           return;
         }}
 
-        const assignee = card.dataset.assignee || "未設定";
-        if (selectedAssignee !== "__all__" && assignee !== selectedAssignee) {{
+        const primaryAssignee = card.dataset.assignee || "未設定";
+        const workloadAssignee = selectedAssignee === "__all__" ? primaryAssignee : selectedAssignee;
+        if (selectedAssignee !== "__all__" && !cardParticipants(card).includes(selectedAssignee)) {{
           return;
         }}
 
-        // Workload is intentionally grouped by the primary assignee only.
-        const item = workload.get(assignee) || {{
-          assignee,
+        // Overall workload stays grouped by primary assignee; filtered workload follows the selected participant.
+        const item = workload.get(workloadAssignee) || {{
+          assignee: workloadAssignee,
           openCount: 0,
           overdueCount: 0,
           highPriorityCount: 0,
@@ -2361,7 +2362,7 @@ def render_kanban_html(
         item.overdueCount += card.dataset.overdue === "true" ? 1 : 0;
         item.highPriorityCount += card.dataset.highPriority === "true" ? 1 : 0;
         item.staleCount += card.dataset.stale === "true" ? 1 : 0;
-        workload.set(assignee, item);
+        workload.set(workloadAssignee, item);
       }});
 
       workloadGrid.replaceChildren();
