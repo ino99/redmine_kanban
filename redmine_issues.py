@@ -1001,7 +1001,7 @@ def render_issue_card(issue: dict[str, Any], redmine_url: str) -> str:
     questions_html = (
         f"""
           <section class="evening-check">
-            <h3>夕会確認</h3>
+            <h3>状況確認</h3>
             <ul>
 {question_items}
             </ul>
@@ -2823,7 +2823,7 @@ def print_alert_issues(issues: list[dict[str, Any]], redmine_url: str) -> None:
         print(f"#{issue.get('id', '-')} {issue.get('subject', '-')}")
         print(f"担当: {issue_field(issue, 'assigned_to')}")
         print(f"理由: {', '.join(alerts)}")
-        print("夕会で確認すること:")
+        print("状況確認すること:")
         for question in questions:
             print(f"- {question}")
         print(f"URL: {issue_url(issue, redmine_url)}")
