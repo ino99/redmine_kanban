@@ -12,6 +12,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import RLock, Thread
@@ -39,6 +40,7 @@ CACHE_SCHEMA_VERSION = 1
 DEFAULT_SERVE_HOST = "127.0.0.1"
 DEFAULT_SERVE_PORT = 8000
 DEFAULT_PROJECT_ID = "my-redmine-project"
+PROJECT_ID_COOKIE_NAME = "redmine_kanban_project_id"
 STATUS_ORDER = [
     "new",
     "assigned",
@@ -881,7 +883,7 @@ def render_theme_filter() -> str:
 
 def render_project_control(project_id: str) -> str:
     return f"""
-        <form class="project-control" action="/{OUTPUT_HTML}" method="get">
+        <form class="project-control" action="/project" method="post">
           <label>
             <span>PROJECT_ID</span>
             <div class="project-id-picker">
@@ -2706,6 +2708,33 @@ def request_project_id(query: dict[str, list[str]]) -> str | None:
     return value or None
 
 
+def request_cookie_project_id(headers: Any) -> str | None:
+    cookie_header = headers.get("Cookie")
+    if not cookie_header:
+        return None
+
+    cookie = SimpleCookie()
+    try:
+        cookie.load(cookie_header)
+    except Exception:
+        return None
+
+    morsel = cookie.get(PROJECT_ID_COOKIE_NAME)
+    if morsel is None:
+        return None
+
+    value = morsel.value.strip()
+    return value or None
+
+
+def project_id_cookie_header(project_id: str) -> str:
+    cookie = SimpleCookie()
+    cookie[PROJECT_ID_COOKIE_NAME] = project_id
+    cookie[PROJECT_ID_COOKIE_NAME]["path"] = "/"
+    cookie[PROJECT_ID_COOKIE_NAME]["samesite"] = "Lax"
+    return cookie.output(header="").strip()
+
+
 def merge_issues(
     current_issues: list[dict[str, Any]], updated_issues: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -2876,7 +2905,7 @@ def render_error_html(message: str) -> str:
 
 def render_loading_html(project_id: str | None) -> str:
     project_id_value = project_id or resolve_project_id(None)
-    reload_url = f"/{OUTPUT_HTML}?{urlencode({'project_id': project_id_value})}"
+    reload_url = f"/{OUTPUT_HTML}"
     reload_url_json = json.dumps(reload_url)
     return f"""<!doctype html>
 <html lang="ja" data-theme="system">
@@ -2996,7 +3025,17 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             return
 
         query = parse_qs(parsed_url.query)
-        project_id = request_project_id(query)
+        query_project_id = request_project_id(query)
+        if query_project_id:
+            resolved_project_id = resolve_project_id(query_project_id)
+            self.send_response(303)
+            self.send_header("Location", f"/{OUTPUT_HTML}")
+            self.send_header("Set-Cookie", project_id_cookie_header(resolved_project_id))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+
+        project_id = request_cookie_project_id(self.headers)
 
         try:
             resolved_project_id = resolve_project_id(project_id)
@@ -3053,7 +3092,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed_url = urlparse(self.path)
-        if parsed_url.path != "/refresh":
+        if parsed_url.path not in {"/project", "/refresh"}:
             self.send_error(404, "Not Found")
             return
 
@@ -3061,6 +3100,16 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length).decode("utf-8")
         form = parse_qs(body)
         project_id = request_project_id(form)
+
+        if parsed_url.path == "/project":
+            resolved_project_id = resolve_project_id(project_id)
+            self.send_response(303)
+            self.send_header("Location", f"/{OUTPUT_HTML}")
+            self.send_header("Set-Cookie", project_id_cookie_header(resolved_project_id))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+
         refresh_mode = form.get("refresh_mode", ["incremental"])[0]
         if refresh_mode not in {"incremental", "full"}:
             refresh_mode = "incremental"
@@ -3090,9 +3139,10 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(encoded_body)
             return
 
-        location = f"/{OUTPUT_HTML}?{urlencode({'project_id': resolved_project_id})}"
+        location = f"/{OUTPUT_HTML}"
         self.send_response(303)
         self.send_header("Location", location)
+        self.send_header("Set-Cookie", project_id_cookie_header(resolved_project_id))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
