@@ -63,6 +63,15 @@ for ($i = 0; $i -lt $AppArgs.Count; $i++) {
 
 $url = "http://127.0.0.1:$port/kanban.html"
 
+if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) {
+    Write-Host ""
+    Write-Host "Redmine Kanban is already running on $url."
+    if ($OpenBrowser) {
+        Start-Process $url
+    }
+    exit 0
+}
+
 if ($OpenBrowser) {
     $helperCommand = @"
 `$url = '$url'
