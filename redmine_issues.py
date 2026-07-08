@@ -333,6 +333,16 @@ def format_hours(value: float) -> str:
     return f"{value:.1f}h"
 
 
+def format_refreshed_at(value: datetime | None) -> str:
+    if value is None:
+        return "未取得"
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    local_value = value.astimezone()
+    return local_value.strftime("%Y/%m/%d %H:%M")
+
+
 def is_closed_or_canceled(issue: dict[str, Any]) -> bool:
     status_name = issue_field(issue, "status", "")
     return status_name in COMPLETED_STATUSES or status_name.lower() in COMPLETED_STATUS_KEYS
@@ -1370,31 +1380,37 @@ def render_workload_status_html(
 
     remaining_work_panel_html = (
         """
-    <section class="panel remaining-pie-panel" aria-label="残作業時間円グラフ">
-      <div class="panel-header">
-        <div>
-          <h2>残作業時間の割合</h2>
-          <p>担当者フィルタに連動して、残作業時間の配分を表示します</p>
-        </div>
-      </div>
-      <div class="remaining-pie-body">
-        <section class="assignment-bars" aria-label="割り当てチケット数">
-          <div class="mini-panel-header">
-            <h3>割り当てチケット数</h3>
+    <section class="chart-panel-grid">
+      <section class="panel assignment-panel" aria-label="割り当てチケット数">
+        <div class="panel-header compact-panel-header">
+          <div>
+            <h2>割り当てチケット数</h2>
             <p>主担当 / 副担当</p>
           </div>
+        </div>
+        <div class="assignment-only-body">
           <div class="assignment-bar-list" id="assignment-bar-list"></div>
-        </section>
-        <section class="remaining-pie-area" aria-label="残作業時間の割合">
-          <div class="remaining-pie-chart" id="remaining-pie-chart" role="img" aria-label="残作業時間の割合">
-            <div class="remaining-pie-center">
-              <span id="remaining-pie-total">-</span>
-              <small>合計</small>
-            </div>
+        </div>
+      </section>
+      <section class="panel remaining-pie-panel" aria-label="残作業時間円グラフ">
+        <div class="panel-header compact-panel-header">
+          <div>
+            <h2>残作業時間</h2>
+            <p>担当者別割合</p>
           </div>
-          <ul class="remaining-pie-legend" id="remaining-pie-legend"></ul>
-        </section>
-      </div>
+        </div>
+        <div class="remaining-pie-body">
+          <div class="remaining-pie-content">
+            <div class="remaining-pie-chart" id="remaining-pie-chart" role="img" aria-label="残作業時間の割合">
+              <div class="remaining-pie-center">
+                <span id="remaining-pie-total">-</span>
+                <small>合計</small>
+              </div>
+            </div>
+            <ul class="remaining-pie-legend" id="remaining-pie-legend"></ul>
+          </div>
+        </div>
+      </section>
     </section>"""
         if has_remaining_work
         else """
@@ -1470,6 +1486,54 @@ def render_workload_status_html(
         --low-bg: #164e63;
         --medium-bg: #713f12;
       }}
+    }}
+
+    html[data-theme="light"] {{
+      color-scheme: light;
+      --bg-color: #f6f7f9;
+      --text-color: #1f2937;
+      --muted-text: #64748b;
+      --panel-bg: #ffffff;
+      --panel-border: #d8dee8;
+      --button-bg: #374151;
+      --button-hover-bg: #111827;
+      --button-text: #ffffff;
+      --link-color: #0f766e;
+      --shadow-color: rgba(15, 23, 42, 0.08);
+      --high-bg: #fee2e2;
+      --high-text: #7f1d1d;
+      --high-border: #ef4444;
+      --warning-bg: #fef3c7;
+      --warning-text: #78350f;
+      --warning-border: #f59e0b;
+      --normal-bg: #dcfce7;
+      --normal-text: #14532d;
+      --low-bg: #e0f2fe;
+      --medium-bg: #fde68a;
+    }}
+
+    html[data-theme="dark"] {{
+      color-scheme: dark;
+      --bg-color: #0f172a;
+      --text-color: #e5e7eb;
+      --muted-text: #cbd5e1;
+      --panel-bg: #111827;
+      --panel-border: #374151;
+      --button-bg: #0f766e;
+      --button-hover-bg: #14b8a6;
+      --button-text: #ffffff;
+      --link-color: #5eead4;
+      --shadow-color: rgba(0, 0, 0, 0.35);
+      --high-bg: #7f1d1d;
+      --high-text: #fee2e2;
+      --high-border: #f87171;
+      --warning-bg: #713f12;
+      --warning-text: #fef3c7;
+      --warning-border: #fbbf24;
+      --normal-bg: #14532d;
+      --normal-text: #dcfce7;
+      --low-bg: #164e63;
+      --medium-bg: #713f12;
     }}
 
     body {{
@@ -1554,32 +1618,15 @@ def render_workload_status_html(
       padding: 16px;
     }}
 
-    .remaining-pie-body {{
+    .chart-panel-grid {{
       display: grid;
-      grid-template-columns: minmax(300px, 1.1fr) minmax(360px, 1fr);
-      gap: 18px;
+      grid-template-columns: minmax(360px, 1.1fr) minmax(360px, 0.9fr);
+      gap: 16px;
       align-items: start;
-      padding: 16px;
     }}
 
-    .mini-panel-header {{
-      display: flex;
-      align-items: baseline;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 10px;
-    }}
-
-    .mini-panel-header h3 {{
-      margin: 0;
-      font-size: 14px;
-    }}
-
-    .mini-panel-header p {{
-      margin: 0;
-      color: var(--muted-text);
-      font-size: 12px;
-      font-weight: 700;
+    .compact-panel-header {{
+      padding-block: 12px;
     }}
 
     .assignment-bar-list {{
@@ -1660,7 +1707,11 @@ def render_workload_status_html(
       background: #a78bfa;
     }}
 
-    .remaining-pie-area {{
+    .remaining-pie-body {{
+      padding: 16px;
+    }}
+
+    .remaining-pie-content {{
       display: grid;
       grid-template-columns: minmax(170px, 220px) minmax(0, 1fr);
       gap: 16px;
@@ -2095,11 +2146,11 @@ def render_workload_status_html(
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }}
 
-      .remaining-pie-body {{
+      .chart-panel-grid {{
         grid-template-columns: 1fr;
       }}
 
-      .remaining-pie-area {{
+      .remaining-pie-content {{
         grid-template-columns: 1fr;
       }}
 
@@ -2192,6 +2243,7 @@ def render_workload_status_html(
   </main>
   <script type="application/json" id="workload-data">{people_json}</script>
   <script>
+    const THEME_STORAGE_KEY = "redmine-kanban-theme";
     const people = JSON.parse(document.getElementById("workload-data").textContent || "[]");
     const projectId = {script_json(project_id)};
     const hasRemainingWork = {has_remaining_work_json};
@@ -2219,6 +2271,24 @@ def render_workload_status_html(
       "#4f46e5",
       "#65a30d",
     ];
+
+    function getSavedTheme() {{
+      const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+      return ["light", "dark", "system"].includes(savedTheme) ? savedTheme : "system";
+    }}
+
+    function applyTheme(theme) {{
+      document.documentElement.dataset.theme = ["light", "dark", "system"].includes(theme) ? theme : "system";
+    }}
+
+    function initializeThemeSync() {{
+      applyTheme(getSavedTheme());
+      window.addEventListener("storage", (event) => {{
+        if (event.key === THEME_STORAGE_KEY) {{
+          applyTheme(getSavedTheme());
+        }}
+      }});
+    }}
 
     function formatHours(value) {{
       if (!value || value <= 0) {{
@@ -2530,6 +2600,7 @@ def render_workload_status_html(
       applyPeopleFilter();
     }});
 
+    initializeThemeSync();
     applySavedAssignees();
     if (people.length) {{
       applyPeopleFilter();
@@ -2546,7 +2617,7 @@ def render_workload_status_html(
 
 def render_combined_html(project_id: str) -> str:
     return f"""<!doctype html>
-<html lang="ja">
+<html lang="ja" data-theme="system">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -2578,6 +2649,28 @@ def render_combined_html(project_id: str) -> str:
         --button-hover-bg: #14b8a6;
         --button-text: #ffffff;
       }}
+    }}
+
+    html[data-theme="light"] {{
+      color-scheme: light;
+      --bg-color: #f3f4f6;
+      --text-color: #1f2937;
+      --muted-text: #64748b;
+      --panel-border: #cbd5e1;
+      --button-bg: #374151;
+      --button-hover-bg: #111827;
+      --button-text: #ffffff;
+    }}
+
+    html[data-theme="dark"] {{
+      color-scheme: dark;
+      --bg-color: #0f172a;
+      --text-color: #e5e7eb;
+      --muted-text: #cbd5e1;
+      --panel-border: #374151;
+      --button-bg: #0f766e;
+      --button-hover-bg: #14b8a6;
+      --button-text: #ffffff;
     }}
 
     html,
@@ -2719,13 +2812,35 @@ def render_combined_html(project_id: str) -> str:
       <iframe title="作業負荷状況" src="/{WORKLOAD_HTML}"></iframe>
     </section>
   </main>
+  <script>
+    const THEME_STORAGE_KEY = "redmine-kanban-theme";
+
+    function getSavedTheme() {{
+      const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+      return ["light", "dark", "system"].includes(savedTheme) ? savedTheme : "system";
+    }}
+
+    function applyTheme(theme) {{
+      document.documentElement.dataset.theme = ["light", "dark", "system"].includes(theme) ? theme : "system";
+    }}
+
+    applyTheme(getSavedTheme());
+    window.addEventListener("storage", (event) => {{
+      if (event.key === THEME_STORAGE_KEY) {{
+        applyTheme(getSavedTheme());
+      }}
+    }});
+  </script>
 </body>
 </html>
 """
 
 
 def render_kanban_html(
-    issues: list[dict[str, Any]], redmine_url: str, project_id: str
+    issues: list[dict[str, Any]],
+    redmine_url: str,
+    project_id: str,
+    refreshed_at: datetime | None = None,
 ) -> str:
     grouped = group_issues_by_status(issues)
     columns = []
@@ -2948,6 +3063,12 @@ def render_kanban_html(
       margin: 0;
       color: var(--body-muted-text);
       font-size: 14px;
+    }}
+
+    .page-header .data-refreshed-at {{
+      margin-top: 6px;
+      font-size: 12px;
+      font-weight: 700;
     }}
 
     .top-row {{
@@ -3666,9 +3787,10 @@ def render_kanban_html(
   <header class="page-header">
     <div class="top-row">
       <div>
-        <h1>Redmine Kanban</h1>
-        <p><span id="visible-issue-count">{len(issues)}</span> / {len(issues)} issues</p>
-{render_project_control(project_id)}
+      <h1>Redmine Kanban</h1>
+      <p><span id="visible-issue-count">{len(issues)}</span> / {len(issues)} issues</p>
+      <p class="data-refreshed-at">取得: {escape_text(format_refreshed_at(refreshed_at))}</p>
+      {render_project_control(project_id)}
       </div>
 {filter_html}
     </div>
@@ -4274,7 +4396,7 @@ def write_kanban_html(
 ) -> Path:
     output_path = Path(OUTPUT_HTML).resolve()
     output_path.write_text(
-        render_kanban_html(issues, redmine_url, project_id), encoding="utf-8"
+        render_kanban_html(issues, redmine_url, project_id, datetime.now(timezone.utc)), encoding="utf-8"
     )
     workload_path = Path(WORKLOAD_HTML).resolve()
     workload_path.write_text(
@@ -4517,14 +4639,19 @@ def merge_issues(
 
 def load_cached_issue_data(
     project_id_override: str | None = None, refresh_mode: str | None = None
-) -> tuple[str, str, list[dict[str, Any]]]:
+) -> tuple[str, str, list[dict[str, Any]], datetime | None]:
     load_env()
     project_id = resolve_project_id(project_id_override)
 
     with ISSUE_CACHE_LOCK:
         cached = ISSUE_CACHE.get(project_id)
         if cached and refresh_mode is None:
-            return cached.redmine_url, project_id, displayable_issues(cached.issues)
+            return (
+                cached.redmine_url,
+                project_id,
+                displayable_issues(cached.issues),
+                cached.refreshed_at,
+            )
 
         cached_issues = list(cached.issues) if cached else []
         cached_refreshed_at = cached.refreshed_at if cached else None
@@ -4550,7 +4677,7 @@ def load_cached_issue_data(
 
     save_issue_cache_to_disk(resolved_project_id, cache_entry)
 
-    return redmine_url, resolved_project_id, visible_issues
+    return redmine_url, resolved_project_id, visible_issues, cache_entry.refreshed_at
 
 
 def start_background_refresh(
@@ -4830,7 +4957,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(encoded_body)
                 return
 
-            redmine_url, resolved_project_id, visible_issues = load_cached_issue_data(project_id)
+            redmine_url, resolved_project_id, visible_issues, refreshed_at = load_cached_issue_data(project_id)
             start_background_refresh(
                 resolved_project_id,
                 refresh_mode="incremental",
@@ -4844,7 +4971,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                 response_body = render_combined_html(resolved_project_id)
             else:
                 response_body = render_kanban_html(
-                    visible_issues, redmine_url, resolved_project_id
+                    visible_issues, redmine_url, resolved_project_id, refreshed_at
                 )
             status_code = 200
         except (ValueError, RuntimeError) as exc:
@@ -4889,7 +5016,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                 file=sys.stderr,
                 flush=True,
             )
-            _, resolved_project_id, _ = load_cached_issue_data(
+            _, resolved_project_id, _, _ = load_cached_issue_data(
                 project_id, refresh_mode=refresh_mode
             )
             print(
