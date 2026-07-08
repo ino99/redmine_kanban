@@ -1250,6 +1250,8 @@ def render_workload_status_html(
 ) -> str:
     people, _totals = calculate_workload_dashboard(issues, redmine_url)
     people_json = script_json(people)
+    has_remaining_work = any(remaining_work_hours(issue) > 0 for issue in issues)
+    has_remaining_work_json = script_json(has_remaining_work)
     max_values = {
         "open_count": max([item["open_count"] for item in people] or [0]),
         "overdue_count": max([item["overdue_count"] for item in people] or [0]),
@@ -1275,8 +1277,15 @@ def render_workload_status_html(
         ("high_load_count", "高負荷", selected_totals["high_load_count"]),
         ("overdue_count", "期限超過", selected_totals["overdue_count"]),
         ("high_priority_count", "高優先度", selected_totals["high_priority_count"]),
-        ("primary_remaining_hours", "残作業時間", format_hours(selected_totals["primary_remaining_hours"])),
     ]
+    if has_remaining_work:
+        stat_cards.append(
+            (
+                "primary_remaining_hours",
+                "残作業時間",
+                format_hours(selected_totals["primary_remaining_hours"]),
+            )
+        )
     stat_cards_html = "\n".join(
         f"""
         <article class="stat-card">
@@ -1298,6 +1307,11 @@ def render_workload_status_html(
     person_cards = []
     for index, item in enumerate(people):
         selected_class = " is-selected" if index == 0 else ""
+        remaining_metric_html = (
+            f'<span><b>{format_hours(item["primary_remaining_hours"])}</b>残</span>'
+            if has_remaining_work
+            else ""
+        )
         person_cards.append(
             f"""
         <button type="button" class="person-card workload-{escape_text(item["level_class"])}{selected_class}" data-assignee="{escape_text(item["assignee"])}">
@@ -1308,7 +1322,7 @@ def render_workload_status_html(
             <span><b>{item["open_count"]}</b>関与</span>
             <span><b>{item["primary_count"]}</b>主</span>
             <span><b>{item["sub_count"]}</b>副</span>
-            <span><b>{format_hours(item["primary_remaining_hours"])}</b>残</span>
+            {remaining_metric_html}
           </span>
         </button>"""
         )
@@ -1320,9 +1334,10 @@ def render_workload_status_html(
         ("overdue_count", "期限超過"),
         ("high_priority_count", "高優先度"),
         ("stale_count", "更新停滞"),
-        ("primary_remaining_hours", "残作業h"),
         ("score", "スコア"),
     ]
+    if has_remaining_work:
+        columns.insert(-1, ("primary_remaining_hours", "残作業h"))
     table_rows = []
     for item in people:
         cells = []
@@ -1352,6 +1367,49 @@ def render_workload_status_html(
     else:
         person_cards_html = "\n".join(person_cards)
         table_body_html = "\n".join(table_rows)
+
+    remaining_work_panel_html = (
+        """
+    <section class="panel remaining-pie-panel" aria-label="残作業時間円グラフ">
+      <div class="panel-header">
+        <div>
+          <h2>残作業時間の割合</h2>
+          <p>担当者フィルタに連動して、残作業時間の配分を表示します</p>
+        </div>
+      </div>
+      <div class="remaining-pie-body">
+        <section class="assignment-bars" aria-label="割り当てチケット数">
+          <div class="mini-panel-header">
+            <h3>割り当てチケット数</h3>
+            <p>主担当 / 副担当</p>
+          </div>
+          <div class="assignment-bar-list" id="assignment-bar-list"></div>
+        </section>
+        <section class="remaining-pie-area" aria-label="残作業時間の割合">
+          <div class="remaining-pie-chart" id="remaining-pie-chart" role="img" aria-label="残作業時間の割合">
+            <div class="remaining-pie-center">
+              <span id="remaining-pie-total">-</span>
+              <small>合計</small>
+            </div>
+          </div>
+          <ul class="remaining-pie-legend" id="remaining-pie-legend"></ul>
+        </section>
+      </div>
+    </section>"""
+        if has_remaining_work
+        else """
+    <section class="panel assignment-panel" aria-label="割り当てチケット数">
+      <div class="panel-header">
+        <div>
+          <h2>割り当てチケット数</h2>
+          <p>担当者フィルタに連動して、主担当 / 副担当の件数を表示します</p>
+        </div>
+      </div>
+      <div class="assignment-only-body">
+        <div class="assignment-bar-list" id="assignment-bar-list"></div>
+      </div>
+    </section>"""
+    )
 
     return f"""<!doctype html>
 <html lang="ja" data-theme="system">
@@ -1482,6 +1540,217 @@ def render_workload_status_html(
       display: grid;
       grid-template-columns: repeat(6, minmax(120px, 1fr));
       gap: 10px;
+    }}
+
+    .remaining-pie-panel {{
+      overflow: visible;
+    }}
+
+    .assignment-panel {{
+      overflow: visible;
+    }}
+
+    .assignment-only-body {{
+      padding: 16px;
+    }}
+
+    .remaining-pie-body {{
+      display: grid;
+      grid-template-columns: minmax(300px, 1.1fr) minmax(360px, 1fr);
+      gap: 18px;
+      align-items: start;
+      padding: 16px;
+    }}
+
+    .mini-panel-header {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }}
+
+    .mini-panel-header h3 {{
+      margin: 0;
+      font-size: 14px;
+    }}
+
+    .mini-panel-header p {{
+      margin: 0;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 700;
+    }}
+
+    .assignment-bar-list {{
+      display: grid;
+      gap: 9px;
+    }}
+
+    .assignment-bar-row {{
+      display: grid;
+      grid-template-columns: minmax(96px, 150px) minmax(0, 1fr) auto;
+      gap: 9px;
+      align-items: center;
+      min-height: 34px;
+      font-size: 12px;
+      font-weight: 700;
+    }}
+
+    .assignment-bar-name {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+
+    .assignment-bar-track {{
+      display: flex;
+      height: 18px;
+      min-width: 0;
+      overflow: hidden;
+      background: color-mix(in srgb, var(--panel-border) 26%, transparent);
+      border-radius: 999px;
+    }}
+
+    .assignment-bar-primary,
+    .assignment-bar-sub {{
+      min-width: 0;
+    }}
+
+    .assignment-bar-primary {{
+      background: var(--link-color);
+    }}
+
+    .assignment-bar-sub {{
+      background: #a78bfa;
+    }}
+
+    .assignment-bar-value {{
+      color: var(--muted-text);
+      white-space: nowrap;
+    }}
+
+    .assignment-bar-legend {{
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 700;
+    }}
+
+    .assignment-bar-legend span {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }}
+
+    .assignment-bar-legend i {{
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+    }}
+
+    .assignment-bar-legend .primary {{
+      background: var(--link-color);
+    }}
+
+    .assignment-bar-legend .sub {{
+      background: #a78bfa;
+    }}
+
+    .remaining-pie-area {{
+      display: grid;
+      grid-template-columns: minmax(170px, 220px) minmax(0, 1fr);
+      gap: 16px;
+      align-items: center;
+    }}
+
+    .remaining-pie-chart {{
+      position: relative;
+      width: min(220px, 100%);
+      aspect-ratio: 1;
+      margin: 0 auto;
+      border: 1px solid var(--panel-border);
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--panel-border) 32%, transparent);
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--panel-bg) 80%, transparent);
+    }}
+
+    .remaining-pie-chart.is-hidden {{
+      display: none;
+    }}
+
+    .remaining-pie-chart::after {{
+      position: absolute;
+      inset: 25%;
+      content: "";
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 50%;
+      box-shadow: 0 1px 2px var(--shadow-color);
+    }}
+
+    .remaining-pie-center {{
+      position: absolute;
+      z-index: 1;
+      inset: 31%;
+      display: grid;
+      place-content: center;
+      text-align: center;
+    }}
+
+    .remaining-pie-center span {{
+      font-size: 22px;
+      font-weight: 900;
+      line-height: 1;
+    }}
+
+    .remaining-pie-center small {{
+      margin-top: 4px;
+      color: var(--muted-text);
+      font-size: 11px;
+      font-weight: 800;
+    }}
+
+    .remaining-pie-legend {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }}
+
+    .remaining-pie-legend li {{
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      min-height: 34px;
+      padding: 7px 9px;
+      background: color-mix(in srgb, var(--panel-border) 20%, transparent);
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 700;
+    }}
+
+    .remaining-pie-swatch {{
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+    }}
+
+    .remaining-pie-name {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+
+    .remaining-pie-value {{
+      color: var(--muted-text);
+      white-space: nowrap;
     }}
 
     .people-filter {{
@@ -1775,6 +2044,10 @@ def render_workload_status_html(
       border-radius: 8px;
     }}
 
+    .issue-row.no-remaining-work {{
+      grid-template-columns: auto minmax(0, 1fr) repeat(3, auto);
+    }}
+
     .issue-row a {{
       color: var(--link-color);
       font-weight: 800;
@@ -1822,6 +2095,14 @@ def render_workload_status_html(
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }}
 
+      .remaining-pie-body {{
+        grid-template-columns: 1fr;
+      }}
+
+      .remaining-pie-area {{
+        grid-template-columns: 1fr;
+      }}
+
       .person-list {{
         max-height: none;
       }}
@@ -1852,6 +2133,7 @@ def render_workload_status_html(
     <section class="summary-grid" aria-label="全体サマリー">
 {stat_cards_html}
     </section>
+{remaining_work_panel_html}
     <section class="panel people-filter" aria-label="担当者フィルタ">
       <div class="people-filter-header">
         <h2>担当者フィルタ</h2>
@@ -1912,6 +2194,7 @@ def render_workload_status_html(
   <script>
     const people = JSON.parse(document.getElementById("workload-data").textContent || "[]");
     const projectId = {script_json(project_id)};
+    const hasRemainingWork = {has_remaining_work_json};
     const WORKLOAD_PEOPLE_STORAGE_KEY = `redmine-kanban-workload-people:${{projectId}}`;
     const personList = document.getElementById("person-list");
     const filterCheckboxes = Array.from(document.querySelectorAll(".person-filter-checkbox"));
@@ -1920,6 +2203,22 @@ def render_workload_status_html(
     const detailTitle = document.getElementById("detail-title");
     const detailSummary = document.getElementById("detail-summary");
     const detailBody = document.getElementById("detail-body");
+    const assignmentBarList = document.getElementById("assignment-bar-list");
+    const remainingPieChart = document.getElementById("remaining-pie-chart");
+    const remainingPieTotal = document.getElementById("remaining-pie-total");
+    const remainingPieLegend = document.getElementById("remaining-pie-legend");
+    const PIE_COLORS = [
+      "#0f766e",
+      "#2563eb",
+      "#7c3aed",
+      "#dc2626",
+      "#d97706",
+      "#16a34a",
+      "#0891b2",
+      "#be185d",
+      "#4f46e5",
+      "#65a30d",
+    ];
 
     function formatHours(value) {{
       if (!value || value <= 0) {{
@@ -1977,7 +2276,131 @@ def render_workload_status_html(
       updateStat("high_load_count", selectedPeople.filter((person) => person.level_class === "high").length);
       updateStat("overdue_count", selectedPeople.reduce((total, person) => total + person.overdue_count, 0));
       updateStat("high_priority_count", selectedPeople.reduce((total, person) => total + person.high_priority_count, 0));
-      updateStat("primary_remaining_hours", formatHours(selectedPeople.reduce((total, person) => total + person.primary_remaining_hours, 0)));
+      if (hasRemainingWork) {{
+        updateStat("primary_remaining_hours", formatHours(selectedPeople.reduce((total, person) => total + person.primary_remaining_hours, 0)));
+      }}
+    }}
+
+    function updateAssignmentBars(selectedPeople) {{
+      const rows = selectedPeople
+        .map((person) => ({{
+          assignee: person.assignee,
+          primary: Number(person.primary_count || 0),
+          sub: Number(person.sub_count || 0),
+          total: Number(person.primary_count || 0) + Number(person.sub_count || 0),
+        }}))
+        .filter((item) => item.total > 0)
+        .sort((a, b) => b.total - a.total || a.assignee.localeCompare(b.assignee, "ja"));
+      const maxTotal = Math.max(...rows.map((item) => item.total), 1);
+
+      assignmentBarList.replaceChildren();
+      if (!rows.length) {{
+        const empty = document.createElement("p");
+        empty.className = "empty-message";
+        empty.textContent = "割り当てチケットはありません";
+        assignmentBarList.append(empty);
+        return;
+      }}
+
+      rows.forEach((item) => {{
+        const row = document.createElement("div");
+        const name = document.createElement("span");
+        const track = document.createElement("span");
+        const primary = document.createElement("span");
+        const sub = document.createElement("span");
+        const value = document.createElement("span");
+        const totalWidth = item.total / maxTotal * 100;
+        const primaryWidth = item.total > 0 ? item.primary / item.total * totalWidth : 0;
+        const subWidth = item.total > 0 ? item.sub / item.total * totalWidth : 0;
+
+        row.className = "assignment-bar-row";
+        name.className = "assignment-bar-name";
+        name.textContent = item.assignee;
+        name.title = item.assignee;
+        track.className = "assignment-bar-track";
+        primary.className = "assignment-bar-primary";
+        primary.style.width = `${{primaryWidth}}%`;
+        sub.className = "assignment-bar-sub";
+        sub.style.width = `${{subWidth}}%`;
+        value.className = "assignment-bar-value";
+        value.textContent = `${{item.total}}件`;
+        value.title = `主担当 ${{item.primary}}件 / 副担当 ${{item.sub}}件`;
+
+        track.append(primary, sub);
+        row.append(name, track, value);
+        assignmentBarList.append(row);
+      }});
+
+      const legend = document.createElement("div");
+      const primaryLegend = document.createElement("span");
+      const primarySwatch = document.createElement("i");
+      const subLegend = document.createElement("span");
+      const subSwatch = document.createElement("i");
+      legend.className = "assignment-bar-legend";
+      primarySwatch.className = "primary";
+      subSwatch.className = "sub";
+      primaryLegend.append(primarySwatch, "主担当");
+      subLegend.append(subSwatch, "副担当");
+      legend.append(primaryLegend, subLegend);
+      assignmentBarList.append(legend);
+    }}
+
+    function updateRemainingPie(selectedPeople) {{
+      if (!hasRemainingWork || !remainingPieChart || !remainingPieTotal || !remainingPieLegend) {{
+        return;
+      }}
+
+      const slices = selectedPeople
+        .map((person) => ({{
+          assignee: person.assignee,
+          hours: Number(person.primary_remaining_hours || 0),
+        }}))
+        .filter((item) => item.hours > 0)
+        .sort((a, b) => b.hours - a.hours || a.assignee.localeCompare(b.assignee, "ja"));
+      const totalHours = slices.reduce((total, item) => total + item.hours, 0);
+
+      remainingPieTotal.textContent = formatHours(totalHours);
+      remainingPieLegend.replaceChildren();
+
+      if (totalHours <= 0) {{
+        remainingPieChart.classList.add("is-hidden");
+        remainingPieChart.setAttribute("aria-label", "残作業時間はありません");
+        const empty = document.createElement("li");
+        empty.className = "empty-message";
+        empty.textContent = "残作業時間はありません";
+        remainingPieLegend.append(empty);
+        return;
+      }}
+
+      remainingPieChart.classList.remove("is-hidden");
+      let current = 0;
+      const segments = slices.map((item, index) => {{
+        const percent = item.hours / totalHours * 100;
+        const start = current;
+        current += percent;
+        const color = PIE_COLORS[index % PIE_COLORS.length];
+        return `${{color}} ${{start.toFixed(3)}}% ${{current.toFixed(3)}}%`;
+      }});
+      remainingPieChart.style.background = `conic-gradient(${{segments.join(", ")}})`;
+      remainingPieChart.setAttribute("aria-label", `残作業時間 合計 ${{formatHours(totalHours)}}`);
+
+      slices.forEach((item, index) => {{
+        const percent = item.hours / totalHours * 100;
+        const row = document.createElement("li");
+        const swatch = document.createElement("span");
+        const name = document.createElement("span");
+        const value = document.createElement("span");
+
+        swatch.className = "remaining-pie-swatch";
+        swatch.style.background = PIE_COLORS[index % PIE_COLORS.length];
+        name.className = "remaining-pie-name";
+        name.textContent = item.assignee;
+        value.className = "remaining-pie-value";
+        value.textContent = `${{formatHours(item.hours)}} / ${{percent.toFixed(1)}}%`;
+
+        row.append(swatch, name, value);
+        remainingPieLegend.append(row);
+      }});
     }}
 
     function showEmptyDetail() {{
@@ -2001,7 +2424,9 @@ def render_workload_status_html(
       }});
 
       detailTitle.textContent = `${{person.assignee}} のIssue`;
-      detailSummary.textContent = `関与 ${{person.open_count}}件 / 主担当 ${{person.primary_count}}件 / 副担当 ${{person.sub_count}}件 / 案分残作業 ${{formatHours(person.primary_remaining_hours)}}`;
+      detailSummary.textContent = hasRemainingWork
+        ? `関与 ${{person.open_count}}件 / 主担当 ${{person.primary_count}}件 / 副担当 ${{person.sub_count}}件 / 案分残作業 ${{formatHours(person.primary_remaining_hours)}}`
+        : `関与 ${{person.open_count}}件 / 主担当 ${{person.primary_count}}件 / 副担当 ${{person.sub_count}}件`;
       detailBody.replaceChildren();
 
       if (!person.issues.length) {{
@@ -2015,6 +2440,7 @@ def render_workload_status_html(
       person.issues.forEach((issue) => {{
         const row = document.createElement("article");
         row.className = "issue-row";
+        row.classList.toggle("no-remaining-work", !hasRemainingWork);
 
         const id = document.createElement("a");
         id.href = issue.url;
@@ -2038,11 +2464,13 @@ def render_workload_status_html(
         due.className = issue.overdue ? "chip chip-alert" : "chip";
         due.textContent = issue.due_date === "-" ? "期日 -" : `期日 ${{issue.due_date}}`;
 
-        const remaining = document.createElement("span");
-        remaining.className = "chip";
-        remaining.textContent = `残 ${{formatHours(issue.remaining_hours)}}`;
-
-        row.append(id, subject, role, status, due, remaining);
+        row.append(id, subject, role, status, due);
+        if (hasRemainingWork) {{
+          const remaining = document.createElement("span");
+          remaining.className = "chip";
+          remaining.textContent = `残 ${{formatHours(issue.remaining_hours)}}`;
+          row.append(remaining);
+        }}
         detailBody.append(row);
       }});
     }}
@@ -2052,6 +2480,8 @@ def render_workload_status_html(
       const selected = selectedAssignees();
       const selectedPeople = filteredPeople();
       updateSummary(selectedPeople);
+      updateAssignmentBars(selectedPeople);
+      updateRemainingPie(selectedPeople);
 
       document.querySelectorAll(".person-card").forEach((card) => {{
         card.classList.toggle("is-filter-hidden", !selected.has(card.dataset.assignee || ""));
@@ -2104,6 +2534,8 @@ def render_workload_status_html(
     if (people.length) {{
       applyPeopleFilter();
     }} else {{
+      updateAssignmentBars([]);
+      updateRemainingPie([]);
       showEmptyDetail();
     }}
   </script>
@@ -3247,6 +3679,8 @@ def render_kanban_html(
   </main>
   <script>
     const THEME_STORAGE_KEY = "redmine-kanban-theme";
+    const KANBAN_PROJECT_ID = {script_json(project_id)};
+    const KANBAN_FILTER_STORAGE_KEY = `redmine-kanban-filters:${{KANBAN_PROJECT_ID}}`;
     const PROJECT_ID_HISTORY_STORAGE_KEY = "redmine-kanban-project-id-history";
     const PROJECT_ID_HISTORY_LIMIT = 20;
     const themeSelector = document.getElementById("theme-selector");
@@ -3443,11 +3877,77 @@ def render_kanban_html(
     }}
 
     function getSelectedVersions() {{
+      const versionValues = selectedVersionValues();
+      if (versionValues === null) {{
+        return null;
+      }}
+
+      return new Set(versionValues);
+    }}
+
+    function selectedVersionValues() {{
       if (versionAll.checked) {{
         return null;
       }}
 
-      return new Set(versionCheckboxes.filter((checkbox) => checkbox.checked).map((checkbox) => checkbox.value));
+      return versionCheckboxes.filter((checkbox) => checkbox.checked).map((checkbox) => checkbox.value);
+    }}
+
+    function selectOptionIfExists(select, value, fallback = "__all__") {{
+      if (!select) {{
+        return;
+      }}
+
+      const hasOption = Array.from(select.options).some((option) => option.value === value);
+      select.value = hasOption ? value : fallback;
+    }}
+
+    function loadKanbanFilterState() {{
+      try {{
+        const parsed = JSON.parse(localStorage.getItem(KANBAN_FILTER_STORAGE_KEY) || "null");
+        return parsed && typeof parsed === "object" ? parsed : null;
+      }} catch {{
+        return null;
+      }}
+    }}
+
+    function saveKanbanFilterState() {{
+      const state = {{
+        assignee: assigneeFilter.value,
+        ballPossession: ballPossessionFilter ? ballPossessionFilter.value : "__all__",
+        versions: selectedVersionValues(),
+      }};
+      try {{
+        localStorage.setItem(KANBAN_FILTER_STORAGE_KEY, JSON.stringify(state));
+      }} catch {{
+      }}
+    }}
+
+    function restoreKanbanFilterState() {{
+      const state = loadKanbanFilterState();
+      if (!state) {{
+        return;
+      }}
+
+      selectOptionIfExists(assigneeFilter, String(state.assignee || "__all__"));
+      if (ballPossessionFilter) {{
+        selectOptionIfExists(ballPossessionFilter, String(state.ballPossession || "__all__"));
+      }}
+
+      if (Array.isArray(state.versions)) {{
+        const savedVersions = new Set(state.versions.map((value) => String(value)));
+        let restoredCount = 0;
+        versionCheckboxes.forEach((checkbox) => {{
+          checkbox.checked = savedVersions.has(checkbox.value);
+          restoredCount += checkbox.checked ? 1 : 0;
+        }});
+        versionAll.checked = restoredCount === 0;
+      }} else {{
+        versionAll.checked = true;
+        versionCheckboxes.forEach((checkbox) => {{
+          checkbox.checked = false;
+        }});
+      }}
     }}
 
     function cardParticipants(card) {{
@@ -3667,6 +4167,7 @@ def render_kanban_html(
 
       assigneeFilter.value = assignee;
       applyFilters();
+      saveKanbanFilterState();
     }}
 
     function initializeWorkloadAssigneeFilter() {{
@@ -3694,6 +4195,7 @@ def render_kanban_html(
       }}
 
       applyFilters();
+      saveKanbanFilterState();
     }}
 
     function handleVersionCheckboxChange() {{
@@ -3704,6 +4206,7 @@ def render_kanban_html(
       }}
 
       applyFilters();
+      saveKanbanFilterState();
     }}
 
     function resetFilters() {{
@@ -3716,6 +4219,7 @@ def render_kanban_html(
         checkbox.checked = false;
       }});
       applyFilters();
+      saveKanbanFilterState();
     }}
 
     function initializeRefreshStatus() {{
@@ -3740,9 +4244,16 @@ def render_kanban_html(
       }});
     }}
 
-    assigneeFilter.addEventListener("change", applyFilters);
+    restoreKanbanFilterState();
+    assigneeFilter.addEventListener("change", () => {{
+      applyFilters();
+      saveKanbanFilterState();
+    }});
     if (ballPossessionFilter) {{
-      ballPossessionFilter.addEventListener("change", applyFilters);
+      ballPossessionFilter.addEventListener("change", () => {{
+        applyFilters();
+        saveKanbanFilterState();
+      }});
     }}
     versionAll.addEventListener("change", handleVersionAllChange);
     versionCheckboxes.forEach((checkbox) => checkbox.addEventListener("change", handleVersionCheckboxChange));
