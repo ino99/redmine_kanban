@@ -1025,12 +1025,12 @@ def render_project_control(project_id: str) -> str:
               <div class="project-id-history-menu" id="project-id-history-menu" role="listbox" hidden></div>
             </div>
           </label>
-          <button type="submit">表示</button>
-          <button type="submit" name="refresh_mode" value="incremental" formmethod="post" formaction="/refresh">更新</button>
-          <button type="submit" name="refresh_mode" value="full" formmethod="post" formaction="/refresh">全更新</button>
-          <a class="control-link" href="/{WORKLOAD_HTML}" target="_top">作業負荷状況</a>
-          <a class="control-link" href="/{WORKTIME_HTML}" target="_blank" rel="noopener noreferrer">作業時間</a>
-          <a class="control-link" href="/{COMBINED_HTML}" target="_top">同時表示</a>
+          <button class="control-action control-action-display" type="submit">表示</button>
+          <button class="control-action control-action-refresh" type="submit" name="refresh_mode" value="incremental" formmethod="post" formaction="/refresh">更新</button>
+          <button class="control-action control-action-refresh" type="submit" name="refresh_mode" value="full" formmethod="post" formaction="/refresh">全更新</button>
+          <a class="control-link control-link-workload" href="/{WORKLOAD_HTML}" target="_top">作業負荷状況</a>
+          <a class="control-link control-link-worktime" href="/{WORKTIME_HTML}" target="_blank" rel="noopener noreferrer">作業時間</a>
+          <a class="control-link control-link-combined" href="/{COMBINED_HTML}" target="_top">同時表示</a>
           <span class="refresh-status" id="refresh-status" role="status" aria-live="polite"></span>
         </form>"""
 
@@ -2802,11 +2802,21 @@ def render_worktime_html(
     today = date.today()
     week_start = today - timedelta(days=today.weekday())
     last_week_start = week_start - timedelta(days=7)
+    month_start = today.replace(day=1)
+    next_month_start = (
+        date(today.year + 1, 1, 1)
+        if today.month == 12
+        else date(today.year, today.month + 1, 1)
+    )
+    last_month_end = month_start - timedelta(days=1)
+    last_month_start = last_month_end.replace(day=1)
     presets = [
         ("当日", today, today),
         ("昨日", today - timedelta(days=1), today - timedelta(days=1)),
         ("今週", week_start, week_start + timedelta(days=6)),
         ("先週", last_week_start, last_week_start + timedelta(days=6)),
+        ("今月", month_start, next_month_start - timedelta(days=1)),
+        ("先月", last_month_start, last_month_end),
     ]
     preset_links_html = "\n".join(
         f"""
@@ -4639,6 +4649,56 @@ def render_kanban_html(
     .project-control button:hover,
     .project-control .control-link:hover {{
       background: var(--button-hover-bg);
+    }}
+
+    .project-control .control-action-display {{
+      background: #0f766e;
+      border-color: #0f766e;
+    }}
+
+    .project-control .control-action-display:hover {{
+      background: #0f5f59;
+      border-color: #0f5f59;
+    }}
+
+    .project-control .control-action-refresh {{
+      background: #b45309;
+      border-color: #b45309;
+    }}
+
+    .project-control .control-action-refresh:hover {{
+      background: #92400e;
+      border-color: #92400e;
+    }}
+
+    .project-control .control-link-workload {{
+      background: #1d4ed8;
+      border-color: #1d4ed8;
+    }}
+
+    .project-control .control-link-workload:hover {{
+      background: #1e40af;
+      border-color: #1e40af;
+    }}
+
+    .project-control .control-link-worktime {{
+      background: #7c3aed;
+      border-color: #7c3aed;
+    }}
+
+    .project-control .control-link-worktime:hover {{
+      background: #6d28d9;
+      border-color: #6d28d9;
+    }}
+
+    .project-control .control-link-combined {{
+      background: #475569;
+      border-color: #475569;
+    }}
+
+    .project-control .control-link-combined:hover {{
+      background: #334155;
+      border-color: #334155;
     }}
 
     .project-control button.is-refreshing {{
