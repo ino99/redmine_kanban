@@ -3109,6 +3109,36 @@ def render_worktime_html(
       min-width: 210px;
     }}
 
+    .chart-breakdown-control {{
+      min-width: 170px;
+      margin: 0;
+      padding: 7px 9px;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+    }}
+
+    .chart-breakdown-control legend {{
+      padding: 0 4px;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .chart-breakdown-options {{
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }}
+
+    .chart-breakdown-options label {{
+      display: inline-flex;
+      gap: 5px;
+      align-items: center;
+      color: var(--control-text);
+      white-space: nowrap;
+    }}
+
     .chart-actions {{
       display: flex;
       gap: 8px;
@@ -3136,6 +3166,11 @@ def render_worktime_html(
       align-items: center;
       font-size: 13px;
       font-weight: 800;
+    }}
+
+    .worktime-bar-row.is-total {{
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--panel-border);
     }}
 
     .worktime-bar-name {{
@@ -3223,6 +3258,8 @@ def render_worktime_html(
       border: 1px solid var(--panel-border);
       border-radius: 50%;
       background: color-mix(in srgb, var(--panel-border) 32%, transparent);
+      cursor: crosshair;
+      touch-action: none;
     }}
 
     .worktime-pie::after {{
@@ -3242,6 +3279,36 @@ def render_worktime_html(
       place-content: center;
       text-align: center;
       font-weight: 900;
+    }}
+
+    .worktime-pie-tooltip {{
+      position: absolute;
+      z-index: 3;
+      min-width: 150px;
+      max-width: 220px;
+      padding: 7px 9px;
+      color: var(--control-text);
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      box-shadow: 0 10px 24px rgb(15 23 42 / 22%);
+      font-size: 12px;
+      font-weight: 800;
+      pointer-events: none;
+      transform: translate(-50%, calc(-100% - 10px));
+      white-space: nowrap;
+    }}
+
+    .worktime-pie-tooltip strong,
+    .worktime-pie-tooltip span {{
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+
+    .worktime-pie-tooltip span {{
+      margin-top: 2px;
+      color: var(--muted-text);
     }}
 
     .worktime-chart-legend {{
@@ -3399,6 +3466,19 @@ def render_worktime_html(
               <option value="pie">円グラフ / パイチャート</option>
             </select>
           </label>
+          <fieldset class="chart-breakdown-control">
+            <legend>内訳</legend>
+            <div class="chart-breakdown-options">
+              <label>
+                <input type="radio" name="chart-breakdown" value="issue" checked>
+                <span>Issue単位</span>
+              </label>
+              <label>
+                <input type="radio" name="chart-breakdown" value="activity">
+                <span>活動単位</span>
+              </label>
+            </div>
+          </fieldset>
           <button type="button" id="random-order-button">ランダム順</button>
         </div>
       </div>
@@ -3436,9 +3516,11 @@ def render_worktime_html(
     const visibleEntryCount = document.getElementById("visible-entry-count");
     const visibleEntryHours = document.getElementById("visible-entry-hours");
     const chartType = document.getElementById("chart-type");
+    const chartBreakdownRadios = Array.from(document.querySelectorAll('input[name="chart-breakdown"]'));
     const randomOrderButton = document.getElementById("random-order-button");
     const worktimeChart = document.getElementById("worktime-chart");
     const WORKTIME_CHART_STORAGE_KEY = "redmine-kanban-worktime-chart";
+    const WORKTIME_BREAKDOWN_STORAGE_KEY = "redmine-kanban-worktime-breakdown";
     const WORKTIME_RANDOM_ORDER_STORAGE_KEY = "redmine-kanban-worktime-random-order";
     const WORKTIME_PROJECT_ID = {script_json(project_id)};
     const WORKTIME_DATE_FROM = {script_json(date_from.isoformat())};
@@ -3521,40 +3603,55 @@ def render_worktime_html(
       renderRows();
     }}
 
-    function groupedHours(filteredEntries) {{
+    function currentBreakdownType() {{
+      const selected = chartBreakdownRadios.find((radio) => radio.checked);
+      return selected && selected.value === "activity" ? "activity" : "issue";
+    }}
+
+    function breakdownItem(entry, breakdownType) {{
+      if (breakdownType === "activity") {{
+        const activity = entry.activity || "-";
+        return {{ key: activity, label: activity }};
+      }}
+
+      const issueId = entry.issue_id || "-";
+      return {{ key: issueId, label: `#${{issueId}}` }};
+    }}
+
+    function groupedHours(filteredEntries, breakdownType = currentBreakdownType()) {{
       const groups = new Map();
       filteredEntries.forEach((entry) => {{
         const user = entry.user || "-";
-        const issueId = entry.issue_id || "-";
+        const part = breakdownItem(entry, breakdownType);
         const hours = Number(entry.hours || 0);
         const group = groups.get(user) || {{
           user,
           hours: 0,
-          issues: new Map(),
+          parts: new Map(),
         }};
         group.hours += hours;
-        group.issues.set(issueId, (group.issues.get(issueId) || 0) + hours);
+        const existing = group.parts.get(part.key) || {{ key: part.key, label: part.label, hours: 0 }};
+        existing.hours += hours;
+        group.parts.set(part.key, existing);
         groups.set(user, group);
       }});
       return Array.from(groups.values())
         .map((group) => ({{
           user: group.user,
           hours: group.hours,
-          issues: Array.from(group.issues, ([issueId, hours]) => ({{ issueId, hours }}))
+          parts: Array.from(group.parts.values())
             .filter((item) => item.hours > 0)
-            .sort((a, b) => b.hours - a.hours || a.issueId.localeCompare(b.issueId, "ja")),
+            .sort((a, b) => b.hours - a.hours || a.label.localeCompare(b.label, "ja")),
         }}))
         .filter((item) => item.hours > 0)
         .sort((a, b) => b.hours - a.hours || a.user.localeCompare(b.user, "ja"));
     }}
 
-    function groupedIssueHours(filteredEntries, selectedUser) {{
+    function groupedBreakdownHours(filteredEntries, breakdownType) {{
       const groups = new Map();
       filteredEntries.forEach((entry) => {{
-        const issueId = entry.issue_id || "-";
-        const user = entry.user || "-";
-        const label = selectedUser === "__all__" ? `${{user}} / #${{issueId}}` : `#${{issueId}}`;
-        groups.set(label, (groups.get(label) || 0) + Number(entry.hours || 0));
+        const part = breakdownItem(entry, breakdownType);
+        groups.set(part.label, (groups.get(part.label) || 0) + Number(entry.hours || 0));
       }});
       return Array.from(groups, ([label, hours]) => ({{ label, hours }}))
         .filter((item) => item.hours > 0)
@@ -3628,6 +3725,28 @@ def render_worktime_html(
       return order;
     }}
 
+    function totalGroupForBar(groups) {{
+      const parts = new Map();
+      let hours = 0;
+      groups.forEach((group) => {{
+        hours += group.hours;
+        group.parts.forEach((part) => {{
+          const existing = parts.get(part.key) || {{ key: part.key, label: part.label, hours: 0 }};
+          existing.hours += part.hours;
+          parts.set(part.key, existing);
+        }});
+      }});
+
+      return {{
+        user: "全員合計",
+        hours,
+        isTotal: true,
+        parts: Array.from(parts.values())
+          .filter((item) => item.hours > 0)
+          .sort((a, b) => b.hours - a.hours || a.label.localeCompare(b.label, "ja")),
+      }};
+    }}
+
     function renderBarChart(groups, totalHours) {{
       worktimeChart.replaceChildren();
       worktimeChart.className = "worktime-chart worktime-bar-chart";
@@ -3639,18 +3758,13 @@ def render_worktime_html(
         return;
       }}
 
-      const orderedGroups = orderedGroupsForBar(groups);
-      const maxHours = Math.max(...groups.map((item) => item.hours), 1);
-      const issueTotals = new Map();
-      orderedGroups.forEach((item) => {{
-        item.issues.forEach((issue) => {{
-          issueTotals.set(issue.issueId, (issueTotals.get(issue.issueId) || 0) + issue.hours);
-        }});
-      }});
-      const issueColorMap = new Map(
-        Array.from(issueTotals, ([issueId, hours]) => ({{ issueId, hours }}))
-          .sort((a, b) => b.hours - a.hours || a.issueId.localeCompare(b.issueId, "ja"))
-          .map((item, index) => [item.issueId, CHART_COLORS[index % CHART_COLORS.length]])
+      const totalGroup = totalGroupForBar(groups);
+      const orderedGroups = [totalGroup, ...orderedGroupsForBar(groups)];
+      const maxHours = Math.max(...orderedGroups.map((item) => item.hours), 1);
+      const partColorMap = new Map(
+        totalGroup.parts
+          .sort((a, b) => b.hours - a.hours || a.label.localeCompare(b.label, "ja"))
+          .map((item, index) => [item.key, CHART_COLORS[index % CHART_COLORS.length]])
       );
       orderedGroups.forEach((item) => {{
         const row = document.createElement("div");
@@ -3660,31 +3774,31 @@ def render_worktime_html(
         const breakdown = document.createElement("div");
         const percent = totalHours > 0 ? item.hours / totalHours * 100 : 0;
 
-        row.className = "worktime-bar-row";
+        row.className = item.isTotal ? "worktime-bar-row is-total" : "worktime-bar-row";
         name.className = "worktime-bar-name";
         name.textContent = item.user;
         name.title = item.user;
         track.className = "worktime-bar-track";
-        item.issues.forEach((issue, index) => {{
+        item.parts.forEach((part, index) => {{
           const segment = document.createElement("span");
-          const color = issueColorMap.get(issue.issueId) || CHART_COLORS[index % CHART_COLORS.length];
+          const color = partColorMap.get(part.key) || CHART_COLORS[index % CHART_COLORS.length];
           segment.className = "worktime-bar-segment";
-          segment.style.width = `${{issue.hours / maxHours * 100}}%`;
+          segment.style.width = `${{part.hours / maxHours * 100}}%`;
           segment.style.background = color;
-          segment.title = `#${{issue.issueId}} ${{formatHours(issue.hours)}}`;
+          segment.title = `${{part.label}} ${{formatHours(part.hours)}}`;
           track.append(segment);
         }});
         value.className = "worktime-chart-value";
         value.textContent = `${{formatHours(item.hours)}} / ${{percent.toFixed(1)}}%`;
         breakdown.className = "worktime-bar-breakdown";
-        item.issues.forEach((issue, index) => {{
+        item.parts.forEach((part, index) => {{
           const chip = document.createElement("span");
           const swatch = document.createElement("i");
-          const color = issueColorMap.get(issue.issueId) || CHART_COLORS[index % CHART_COLORS.length];
+          const color = partColorMap.get(part.key) || CHART_COLORS[index % CHART_COLORS.length];
           swatch.className = "worktime-issue-swatch";
           swatch.style.background = color;
           chip.style.borderColor = color;
-          chip.append(swatch, `#${{issue.issueId}} ${{formatHours(issue.hours)}}`);
+          chip.append(swatch, `${{part.label}} ${{formatHours(part.hours)}}`);
           breakdown.append(chip);
         }});
 
@@ -3708,6 +3822,7 @@ def render_worktime_html(
       const layout = document.createElement("div");
       const pie = document.createElement("div");
       const center = document.createElement("div");
+      const tooltip = document.createElement("div");
       const legend = document.createElement("ul");
       let current = 0;
       const segments = groups.map((item, index) => {{
@@ -3715,15 +3830,71 @@ def render_worktime_html(
         const start = current;
         current += percent;
         const color = CHART_COLORS[index % CHART_COLORS.length];
-        return `${{color}} ${{start.toFixed(3)}}% ${{current.toFixed(3)}}%`;
+        return {{
+          item,
+          percent,
+          start,
+          end: current,
+          color,
+          gradient: `${{color}} ${{start.toFixed(3)}}% ${{current.toFixed(3)}}%`,
+        }};
       }});
 
       layout.className = "worktime-pie-layout";
       pie.className = "worktime-pie";
-      pie.style.background = `conic-gradient(${{segments.join(", ")}})`;
+      pie.style.background = `conic-gradient(${{segments.map((segment) => segment.gradient).join(", ")}})`;
       center.className = "worktime-pie-center";
       center.textContent = formatHours(totalHours);
+      tooltip.className = "worktime-pie-tooltip";
+      tooltip.hidden = true;
       legend.className = "worktime-chart-legend";
+
+      function segmentAtPointer(event) {{
+        const rect = pie.getBoundingClientRect();
+        const x = event.clientX - rect.left - rect.width / 2;
+        const y = event.clientY - rect.top - rect.height / 2;
+        const angle = (Math.atan2(y, x) * 180 / Math.PI + 90 + 360) % 360;
+        const percent = angle / 3.6;
+        return segments.find((segment) => percent >= segment.start && percent < segment.end) || segments.at(-1);
+      }}
+
+      function showPieTooltip(event) {{
+        const segment = segmentAtPointer(event);
+        if (!segment) {{
+          tooltip.hidden = true;
+          return;
+        }}
+
+        const rect = pie.getBoundingClientRect();
+        const left = Math.min(Math.max(event.clientX - rect.left, 12), rect.width - 12);
+        const top = Math.min(Math.max(event.clientY - rect.top, 12), rect.height - 12);
+        tooltip.innerHTML = "";
+        const label = document.createElement("strong");
+        const value = document.createElement("span");
+        label.textContent = segment.item.label;
+        value.textContent = `${{formatHours(segment.item.hours)}} / ${{segment.percent.toFixed(1)}}%`;
+        tooltip.append(label, value);
+        tooltip.style.left = `${{left}}px`;
+        tooltip.style.top = `${{top}}px`;
+        tooltip.hidden = false;
+      }}
+
+      pie.addEventListener("pointerdown", (event) => {{
+        pie.setPointerCapture(event.pointerId);
+        showPieTooltip(event);
+      }});
+      pie.addEventListener("pointermove", (event) => {{
+        showPieTooltip(event);
+      }});
+      pie.addEventListener("pointerup", (event) => {{
+        showPieTooltip(event);
+        if (pie.hasPointerCapture(event.pointerId)) {{
+          pie.releasePointerCapture(event.pointerId);
+        }}
+      }});
+      pie.addEventListener("pointerleave", () => {{
+        tooltip.hidden = true;
+      }});
 
       groups.forEach((item, index) => {{
         const percent = item.hours / totalHours * 100;
@@ -3741,17 +3912,18 @@ def render_worktime_html(
         legend.append(row);
       }});
 
-      pie.append(center);
+      pie.append(center, tooltip);
       layout.append(pie, legend);
       worktimeChart.append(layout);
     }}
 
     function renderChart(filteredEntries, totalHours) {{
-      const groups = groupedHours(filteredEntries);
+      const breakdownType = currentBreakdownType();
+      const groups = groupedHours(filteredEntries, breakdownType);
       if (chartType.value === "pie") {{
-        const pieGroups = userFilter.value === "__all__"
+        const pieGroups = userFilter.value === "__all__" && breakdownType === "issue"
           ? groups.map((item) => ({{ label: item.user, hours: item.hours }}))
-          : groupedIssueHours(filteredEntries, userFilter.value);
+          : groupedBreakdownHours(filteredEntries, breakdownType);
         renderPieChart(pieGroups, totalHours);
       }} else {{
         renderBarChart(groups, totalHours);
@@ -3810,12 +3982,24 @@ def render_worktime_html(
     if (["bar", "pie"].includes(savedChartType)) {{
       chartType.value = savedChartType;
     }}
+    const savedBreakdownType = localStorage.getItem(WORKTIME_BREAKDOWN_STORAGE_KEY);
+    if (["issue", "activity"].includes(savedBreakdownType)) {{
+      chartBreakdownRadios.forEach((radio) => {{
+        radio.checked = radio.value === savedBreakdownType;
+      }});
+    }}
     chartType.addEventListener("change", () => {{
       localStorage.setItem(WORKTIME_CHART_STORAGE_KEY, chartType.value);
       renderRows();
     }});
+    chartBreakdownRadios.forEach((radio) => {{
+      radio.addEventListener("change", () => {{
+        localStorage.setItem(WORKTIME_BREAKDOWN_STORAGE_KEY, currentBreakdownType());
+        renderRows();
+      }});
+    }});
     randomOrderButton.addEventListener("click", () => {{
-      decideRandomOrder(groupedHours(entries));
+      decideRandomOrder(groupedHours(entries, currentBreakdownType()));
       chartType.value = "bar";
       localStorage.setItem(WORKTIME_CHART_STORAGE_KEY, chartType.value);
       renderRows();
