@@ -38,6 +38,7 @@ BALL_POSSESSION_FIELD_NAME = "ボール所持"
 OUTPUT_HTML = "kanban.html"
 WORKLOAD_HTML = "workload.html"
 COMBINED_HTML = "combined.html"
+WORKTIME_HTML = "worktime.html"
 CACHE_DIR = Path(".cache")
 CACHE_SCHEMA_VERSION = 1
 DEFAULT_SERVE_HOST = "127.0.0.1"
@@ -700,6 +701,89 @@ def format_time_entry_hours(entry: dict[str, Any]) -> str:
     return f"{hours}h"
 
 
+def time_entry_hours_value(entry: dict[str, Any]) -> float:
+    hours = entry.get("hours")
+    try:
+        return float(hours)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def fetch_worktime_entries(
+    redmine_url: str,
+    api_key: str,
+    project_id: str,
+    date_from: date,
+    date_to: date,
+) -> list[dict[str, Any]]:
+    endpoint = urljoin(redmine_url.rstrip("/") + "/", "time_entries.json")
+    retries = env_int("REDMINE_TIME_ENTRY_RETRIES", DEFAULT_TIME_ENTRY_RETRIES, minimum=0)
+    timeout_seconds = env_int(
+        "REDMINE_TIME_ENTRY_TIMEOUT_SECONDS",
+        DEFAULT_TIME_ENTRY_TIMEOUT_SECONDS,
+        minimum=1,
+    )
+    max_pages = env_int("REDMINE_WORKTIME_PAGES", 20, minimum=1)
+    results: list[dict[str, Any]] = []
+
+    for page_index in range(max_pages):
+        params = {
+            "project_id": project_id,
+            "from": date_from.isoformat(),
+            "to": date_to.isoformat(),
+            "limit": TIME_ENTRY_PAGE_LIMIT,
+            "offset": page_index * TIME_ENTRY_PAGE_LIMIT,
+            "sort": "spent_on:desc,created_on:desc",
+        }
+        request = Request(
+            f"{endpoint}?{urlencode(params)}",
+            headers={"X-Redmine-API-Key": api_key},
+        )
+
+        for attempt in range(retries + 1):
+            try:
+                with urlopen(request, timeout=timeout_seconds) as response:
+                    data = json.load(response)
+                break
+            except HTTPError as exc:
+                raise RuntimeError(
+                    f"Redmine 作業時間API がエラーを返しました。HTTP {exc.code}: {endpoint}"
+                ) from exc
+            except TimeoutError as exc:
+                if attempt < retries:
+                    time.sleep(FETCH_RETRY_DELAY_SECONDS)
+                    continue
+                raise RuntimeError(
+                    f"Redmine 作業時間API への接続が{timeout_seconds}秒でタイムアウトしました。"
+                ) from exc
+            except URLError as exc:
+                if attempt < retries:
+                    time.sleep(FETCH_RETRY_DELAY_SECONDS)
+                    continue
+                reason = getattr(exc, "reason", exc)
+                raise RuntimeError(
+                    f"Redmine 作業時間API に接続できませんでした。詳細: {reason}"
+                ) from exc
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Redmine 作業時間API のレスポンスをJSONとして読み取れませんでした。") from exc
+
+        if not isinstance(data, dict):
+            raise RuntimeError("Redmine 作業時間API のレスポンス形式が不正です。")
+
+        entries = data.get("time_entries")
+        if not isinstance(entries, list):
+            raise RuntimeError("Redmine 作業時間API のレスポンスに time_entries 配列がありません。")
+
+        results.extend(entries)
+        total_count = data.get("total_count")
+        if isinstance(total_count, int) and len(results) >= total_count:
+            break
+        if len(entries) < TIME_ENTRY_PAGE_LIMIT:
+            break
+
+    return results
+
+
 def latest_time_entry_comments(
     redmine_url: str,
     api_key: str,
@@ -945,6 +1029,7 @@ def render_project_control(project_id: str) -> str:
           <button type="submit" name="refresh_mode" value="incremental" formmethod="post" formaction="/refresh">更新</button>
           <button type="submit" name="refresh_mode" value="full" formmethod="post" formaction="/refresh">全更新</button>
           <a class="control-link" href="/{WORKLOAD_HTML}" target="_top">作業負荷状況</a>
+          <a class="control-link" href="/{WORKTIME_HTML}" target="_blank" rel="noopener noreferrer">作業時間</a>
           <a class="control-link" href="/{COMBINED_HTML}" target="_top">同時表示</a>
           <span class="refresh-status" id="refresh-status" role="status" aria-live="polite"></span>
         </form>"""
@@ -953,6 +1038,10 @@ def render_project_control(project_id: str) -> str:
 def render_filter_controls(issues: list[dict[str, Any]]) -> str:
     return f"""
     <div class="filter-controls">
+      <label class="issue-id-filter">
+        <span>Issue番号</span>
+        <input type="search" id="issue-id-filter" inputmode="numeric" placeholder="例: 6750 6741" autocomplete="off">
+      </label>
 {render_assignee_filter(issues)}
 {render_version_filter(issues)}
 {render_ball_possession_filter(issues)}
@@ -1106,7 +1195,7 @@ def render_issue_card(issue: dict[str, Any], redmine_url: str) -> str:
     )
 
     return f"""
-        <article class="issue-card" data-assignee="{escape_text(assignee)}" data-participants="{escape_text(participants_json)}" data-version="{escape_text(version)}" data-ball-possession="{escape_text(ball_possession_json)}" data-is-closed="{str(is_closed_or_canceled(issue)).lower()}" data-overdue="{str(flags["overdue"]).lower()}" data-high-priority="{str(flags["high_priority"]).lower()}" data-stale="{str(flags["stale"]).lower()}">
+        <article class="issue-card" data-issue-id="{escape_text(issue_id)}" data-assignee="{escape_text(assignee)}" data-participants="{escape_text(participants_json)}" data-version="{escape_text(version)}" data-ball-possession="{escape_text(ball_possession_json)}" data-is-closed="{str(is_closed_or_canceled(issue)).lower()}" data-overdue="{str(flags["overdue"]).lower()}" data-high-priority="{str(flags["high_priority"]).lower()}" data-stale="{str(flags["stale"]).lower()}">
           <a class="issue-id" href="{escape_text(url)}" target="_blank" rel="noopener noreferrer">#{escape_text(issue_id)}</a>
 {labels_html}
           <h2>{escape_text(subject)}</h2>
@@ -2615,6 +2704,1136 @@ def render_workload_status_html(
 """
 
 
+def parse_worktime_date(value: str | None, fallback: date) -> date:
+    if not value:
+        return fallback
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return fallback
+
+
+def time_entry_issue_id(entry: dict[str, Any]) -> str:
+    issue = entry.get("issue")
+    if isinstance(issue, dict) and issue.get("id") not in (None, ""):
+        return str(issue.get("id"))
+    return "-"
+
+
+def time_entry_activity(entry: dict[str, Any]) -> str:
+    activity = entry.get("activity")
+    if isinstance(activity, dict):
+        return str(activity.get("name") or "-")
+    return "-"
+
+
+def time_entry_comment(entry: dict[str, Any]) -> str:
+    return str(entry.get("comments") or "").strip()
+
+
+def issue_fixed_version_map(issues: list[dict[str, Any]]) -> dict[str, str]:
+    versions: dict[str, str] = {}
+    for issue in issues:
+        issue_id = issue.get("id")
+        if issue_id in (None, ""):
+            continue
+        versions[str(issue_id)] = fixed_version_name(issue)
+    return versions
+
+
+def render_worktime_html(
+    entries: list[dict[str, Any]],
+    redmine_url: str,
+    project_id: str,
+    date_from: date,
+    date_to: date,
+    issue_versions: dict[str, str] | None = None,
+) -> str:
+    issue_versions = issue_versions or {}
+    users = sorted({time_entry_user_name(entry) for entry in entries if time_entry_user_name(entry) != "-"})
+    user_options = ['<option value="__all__">全員</option>']
+    user_options.extend(
+        f'<option value="{escape_text(user)}">{escape_text(user)}</option>' for user in users
+    )
+    unset_version = fixed_version_name({})
+    worktime_entries = []
+    for entry in entries:
+        issue_id = time_entry_issue_id(entry)
+        worktime_entries.append(
+            {
+                "spent_on": str(entry.get("spent_on") or "-"),
+                "user": time_entry_user_name(entry),
+                "issue_id": issue_id,
+                "issue_url": f"{redmine_url.rstrip('/')}/issues/{issue_id}"
+                if issue_id != "-"
+                else "",
+                "version": issue_versions.get(issue_id, unset_version),
+                "activity": time_entry_activity(entry),
+                "hours": time_entry_hours_value(entry),
+                "comment": time_entry_comment(entry),
+            }
+        )
+    worktime_version_names = {item["version"] for item in worktime_entries if item["version"]}
+    worktime_versions = sorted(name for name in worktime_version_names if name != unset_version)
+    if unset_version in worktime_version_names:
+        worktime_versions.append(unset_version)
+    version_items = [
+        """
+        <label class="checkbox-option">
+          <input type="checkbox" id="worktime-version-all" checked>
+          <span>全て</span>
+        </label>"""
+    ]
+    for version in worktime_versions:
+        version_items.append(
+            f"""
+        <label class="checkbox-option">
+          <input type="checkbox" class="worktime-version-checkbox" value="{escape_text(version)}">
+          <span>{escape_text(version)}</span>
+        </label>"""
+        )
+    version_filter_html = f"""
+        <fieldset class="worktime-version-filter">
+          <legend>対象バージョン</legend>
+          <div class="worktime-version-options">
+{''.join(version_items)}
+          </div>
+        </fieldset>""" if worktime_versions else ""
+    today = date.today()
+    week_start = today - timedelta(days=today.weekday())
+    last_week_start = week_start - timedelta(days=7)
+    presets = [
+        ("当日", today, today),
+        ("昨日", today - timedelta(days=1), today - timedelta(days=1)),
+        ("今週", week_start, week_start + timedelta(days=6)),
+        ("先週", last_week_start, last_week_start + timedelta(days=6)),
+    ]
+    preset_links_html = "\n".join(
+        f"""
+          <a class="preset-link" href="/{WORKTIME_HTML}?{urlencode({'from': preset_from.isoformat(), 'to': preset_to.isoformat()})}">{escape_text(label)}</a>"""
+        for label, preset_from, preset_to in presets
+    )
+    entries_json = script_json(worktime_entries)
+
+    return f"""<!doctype html>
+<html lang="ja" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>作業時間 - Redmine Kanban</title>
+  <style>
+    * {{
+      box-sizing: border-box;
+    }}
+
+    :root {{
+      color-scheme: light;
+      --bg-color: #f6f7f9;
+      --text-color: #1f2937;
+      --muted-text: #64748b;
+      --panel-bg: #ffffff;
+      --panel-border: #d8dee8;
+      --control-bg: #ffffff;
+      --control-border: #9ca3af;
+      --control-text: #111827;
+      --button-bg: #0f766e;
+      --button-hover-bg: #0f5f59;
+      --button-text: #ffffff;
+      --link-color: #0f766e;
+      --row-bg: #f8fafc;
+    }}
+
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        color-scheme: dark;
+        --bg-color: #0f172a;
+        --text-color: #e5e7eb;
+        --muted-text: #cbd5e1;
+        --panel-bg: #111827;
+        --panel-border: #374151;
+        --control-bg: #0f172a;
+        --control-border: #475569;
+        --control-text: #f9fafb;
+        --button-bg: #0f766e;
+        --button-hover-bg: #14b8a6;
+        --button-text: #ffffff;
+        --link-color: #5eead4;
+        --row-bg: #172033;
+      }}
+    }}
+
+    html[data-theme="light"] {{
+      color-scheme: light;
+      --bg-color: #f6f7f9;
+      --text-color: #1f2937;
+      --muted-text: #64748b;
+      --panel-bg: #ffffff;
+      --panel-border: #d8dee8;
+      --control-bg: #ffffff;
+      --control-border: #9ca3af;
+      --control-text: #111827;
+      --button-bg: #0f766e;
+      --button-hover-bg: #0f5f59;
+      --button-text: #ffffff;
+      --link-color: #0f766e;
+      --row-bg: #f8fafc;
+    }}
+
+    html[data-theme="dark"] {{
+      color-scheme: dark;
+      --bg-color: #0f172a;
+      --text-color: #e5e7eb;
+      --muted-text: #cbd5e1;
+      --panel-bg: #111827;
+      --panel-border: #374151;
+      --control-bg: #0f172a;
+      --control-border: #475569;
+      --control-text: #f9fafb;
+      --button-bg: #0f766e;
+      --button-hover-bg: #14b8a6;
+      --button-text: #ffffff;
+      --link-color: #5eead4;
+      --row-bg: #172033;
+    }}
+
+    body {{
+      margin: 0;
+      color: var(--text-color);
+      background: var(--bg-color);
+      font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }}
+
+    .page-header {{
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: center;
+      padding: 16px 20px;
+      background: color-mix(in srgb, var(--bg-color) 94%, transparent);
+      border-bottom: 1px solid var(--panel-border);
+      backdrop-filter: blur(10px);
+    }}
+
+    .page-header h1 {{
+      margin: 0 0 4px;
+      font-size: 22px;
+    }}
+
+    .page-header p {{
+      margin: 0;
+      color: var(--muted-text);
+      font-size: 13px;
+    }}
+
+    .button {{
+      display: inline-flex;
+      min-height: 34px;
+      align-items: center;
+      justify-content: center;
+      padding: 7px 11px;
+      color: var(--button-text);
+      background: var(--button-bg);
+      border: 1px solid var(--button-bg);
+      border-radius: 8px;
+      text-decoration: none;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+
+    .button:hover {{
+      background: var(--button-hover-bg);
+    }}
+
+    main {{
+      display: grid;
+      gap: 14px;
+      padding: 16px 20px 24px;
+    }}
+
+    .panel {{
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+
+    .filters {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(150px, 180px)) minmax(180px, 240px) minmax(260px, 1fr) auto;
+      gap: 10px;
+      align-items: end;
+      padding: 14px;
+    }}
+
+    .worktime-version-filter {{
+      min-width: 0;
+      margin: 0;
+      padding: 8px;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+    }}
+
+    .worktime-version-filter legend {{
+      padding: 0 4px;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .worktime-version-options {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      max-height: 82px;
+      overflow: auto;
+    }}
+
+    .worktime-version-options .checkbox-option {{
+      display: inline-flex;
+      min-height: 28px;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 8px;
+      color: var(--control-text);
+      background: var(--row-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .preset-links {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 0 14px 14px;
+    }}
+
+    .preset-link {{
+      display: inline-flex;
+      min-height: 30px;
+      align-items: center;
+      padding: 5px 10px;
+      color: var(--control-text);
+      background: var(--row-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      text-decoration: none;
+    }}
+
+    .preset-link:hover {{
+      border-color: var(--link-color);
+    }}
+
+    label {{
+      display: grid;
+      gap: 4px;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    input,
+    select {{
+      min-height: 34px;
+      padding: 6px 9px;
+      color: var(--control-text);
+      background: var(--control-bg);
+      border: 1px solid var(--control-border);
+      border-radius: 8px;
+      font: inherit;
+      font-weight: 700;
+    }}
+
+    .summary {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(120px, 1fr));
+      gap: 10px;
+      padding: 0 14px 14px;
+    }}
+
+    .summary-card {{
+      padding: 10px;
+      background: var(--row-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+    }}
+
+    .summary-card span {{
+      display: block;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .summary-card strong {{
+      display: block;
+      margin-top: 6px;
+      font-size: 22px;
+    }}
+
+    .chart-panel {{
+      display: grid;
+      gap: 12px;
+      padding: 14px;
+    }}
+
+    .chart-header {{
+      display: flex;
+      gap: 12px;
+      align-items: end;
+      justify-content: space-between;
+      flex-wrap: wrap;
+    }}
+
+    .chart-header h2 {{
+      margin: 0 0 4px;
+      font-size: 16px;
+    }}
+
+    .chart-header p {{
+      margin: 0;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 700;
+    }}
+
+    .chart-type-control {{
+      min-width: 210px;
+    }}
+
+    .chart-actions {{
+      display: flex;
+      gap: 8px;
+      align-items: end;
+      flex-wrap: wrap;
+    }}
+
+    .chart-actions button {{
+      white-space: nowrap;
+    }}
+
+    .worktime-chart {{
+      min-height: 220px;
+    }}
+
+    .worktime-bar-chart {{
+      display: grid;
+      gap: 10px;
+    }}
+
+    .worktime-bar-row {{
+      display: grid;
+      grid-template-columns: minmax(120px, 220px) minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      font-size: 13px;
+      font-weight: 800;
+    }}
+
+    .worktime-bar-name {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+
+    .worktime-bar-track {{
+      display: flex;
+      height: 18px;
+      overflow: hidden;
+      background: color-mix(in srgb, var(--panel-border) 30%, transparent);
+      border-radius: 999px;
+    }}
+
+    .worktime-bar-fill {{
+      display: block;
+      height: 100%;
+      background: var(--link-color);
+      border-radius: inherit;
+    }}
+
+    .worktime-bar-segment {{
+      display: block;
+      flex: 0 0 auto;
+      height: 100%;
+      min-width: 2px;
+    }}
+
+    .worktime-bar-segment:first-child {{
+      border-radius: 999px 0 0 999px;
+    }}
+
+    .worktime-bar-segment:last-child {{
+      border-radius: 0 999px 999px 0;
+    }}
+
+    .worktime-bar-breakdown {{
+      grid-column: 2 / 4;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: -4px;
+      color: var(--muted-text);
+      font-size: 11px;
+      font-weight: 700;
+    }}
+
+    .worktime-bar-breakdown span {{
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 6px;
+      background: var(--row-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 999px;
+      white-space: nowrap;
+    }}
+
+    .worktime-issue-swatch {{
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      flex: 0 0 auto;
+    }}
+
+    .worktime-chart-value {{
+      color: var(--muted-text);
+      white-space: nowrap;
+    }}
+
+    .worktime-pie-layout {{
+      display: grid;
+      grid-template-columns: minmax(180px, 240px) minmax(0, 1fr);
+      gap: 18px;
+      align-items: center;
+    }}
+
+    .worktime-pie {{
+      position: relative;
+      width: min(220px, 100%);
+      aspect-ratio: 1;
+      margin: 0 auto;
+      border: 1px solid var(--panel-border);
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--panel-border) 32%, transparent);
+    }}
+
+    .worktime-pie::after {{
+      position: absolute;
+      inset: 27%;
+      content: "";
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 50%;
+    }}
+
+    .worktime-pie-center {{
+      position: absolute;
+      z-index: 1;
+      inset: 33%;
+      display: grid;
+      place-content: center;
+      text-align: center;
+      font-weight: 900;
+    }}
+
+    .worktime-chart-legend {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }}
+
+    .worktime-chart-legend li {{
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      min-height: 32px;
+      padding: 6px 8px;
+      background: var(--row-bg);
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .worktime-swatch {{
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+    }}
+
+    .table-wrap {{
+      overflow: auto;
+    }}
+
+    table {{
+      width: 100%;
+      min-width: 860px;
+      border-collapse: collapse;
+    }}
+
+    th,
+    td {{
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--panel-border);
+      text-align: left;
+      font-size: 13px;
+      vertical-align: top;
+    }}
+
+    th {{
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 900;
+      white-space: nowrap;
+    }}
+
+    td.hours {{
+      text-align: right;
+      font-weight: 900;
+      white-space: nowrap;
+    }}
+
+    a {{
+      color: var(--link-color);
+      font-weight: 800;
+      text-decoration: none;
+    }}
+
+    .comment {{
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }}
+
+    .empty-message {{
+      padding: 18px;
+      color: var(--muted-text);
+      text-align: center;
+      font-weight: 700;
+    }}
+
+    @media (max-width: 760px) {{
+      .page-header {{
+        display: grid;
+      }}
+
+      .filters,
+      .summary {{
+        grid-template-columns: 1fr;
+      }}
+
+      .worktime-bar-row,
+      .worktime-pie-layout {{
+        grid-template-columns: 1fr;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <header class="page-header">
+    <div>
+      <h1>作業時間</h1>
+      <p>PROJECT_ID: {escape_text(project_id)}</p>
+    </div>
+    <a class="button" href="/{OUTPUT_HTML}" target="_blank" rel="noopener noreferrer">かんばん</a>
+  </header>
+  <main>
+    <section class="panel">
+      <form class="filters" action="/{WORKTIME_HTML}" method="get">
+        <label>
+          <span>開始日</span>
+          <input type="date" name="from" value="{escape_text(date_from.isoformat())}">
+        </label>
+        <label>
+          <span>終了日</span>
+          <input type="date" name="to" value="{escape_text(date_to.isoformat())}">
+        </label>
+        <label>
+          <span>担当者</span>
+          <select id="user-filter">
+            {''.join(user_options)}
+          </select>
+        </label>
+{version_filter_html}
+        <button class="button" type="submit">表示</button>
+      </form>
+      <div class="preset-links" aria-label="期間プリセット">
+{preset_links_html}
+      </div>
+      <div class="summary" aria-label="作業時間サマリー">
+        <article class="summary-card">
+          <span>表示件数</span>
+          <strong id="visible-entry-count">0</strong>
+        </article>
+        <article class="summary-card">
+          <span>合計時間</span>
+          <strong id="visible-entry-hours">-</strong>
+        </article>
+        <article class="summary-card">
+          <span>対象期間</span>
+          <strong>{escape_text(date_from.isoformat())} - {escape_text(date_to.isoformat())}</strong>
+        </article>
+      </div>
+    </section>
+    <section class="panel chart-panel" aria-label="作業時間割合グラフ">
+      <div class="chart-header">
+        <div>
+          <h2>作業時間の割合</h2>
+          <p>おすすめは横棒グラフです。担当者ごとの比較が一番読みやすく、人数が増えても崩れにくいです。</p>
+        </div>
+        <div class="chart-actions">
+          <label class="chart-type-control">
+            <span>グラフ種類</span>
+            <select id="chart-type">
+              <option value="bar">横棒グラフ（おすすめ）</option>
+              <option value="pie">円グラフ / パイチャート</option>
+            </select>
+          </label>
+          <button type="button" id="random-order-button">ランダム順</button>
+        </div>
+      </div>
+      <div class="worktime-chart" id="worktime-chart"></div>
+    </section>
+    <section class="panel">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">日付</th>
+              <th scope="col">担当者</th>
+              <th scope="col">Issue</th>
+              <th scope="col">対象バージョン</th>
+              <th scope="col">活動</th>
+              <th scope="col">時間</th>
+              <th scope="col">コメント</th>
+            </tr>
+          </thead>
+          <tbody id="worktime-body"></tbody>
+        </table>
+      </div>
+      <p class="empty-message" id="worktime-empty" hidden>対象の作業時間はありません。</p>
+    </section>
+  </main>
+  <script type="application/json" id="worktime-data">{entries_json}</script>
+  <script>
+    const THEME_STORAGE_KEY = "redmine-kanban-theme";
+    const entries = JSON.parse(document.getElementById("worktime-data").textContent || "[]");
+    const userFilter = document.getElementById("user-filter");
+    const worktimeVersionAll = document.getElementById("worktime-version-all");
+    const worktimeVersionCheckboxes = Array.from(document.querySelectorAll(".worktime-version-checkbox"));
+    const body = document.getElementById("worktime-body");
+    const empty = document.getElementById("worktime-empty");
+    const visibleEntryCount = document.getElementById("visible-entry-count");
+    const visibleEntryHours = document.getElementById("visible-entry-hours");
+    const chartType = document.getElementById("chart-type");
+    const randomOrderButton = document.getElementById("random-order-button");
+    const worktimeChart = document.getElementById("worktime-chart");
+    const WORKTIME_CHART_STORAGE_KEY = "redmine-kanban-worktime-chart";
+    const WORKTIME_RANDOM_ORDER_STORAGE_KEY = "redmine-kanban-worktime-random-order";
+    const WORKTIME_PROJECT_ID = {script_json(project_id)};
+    const WORKTIME_DATE_FROM = {script_json(date_from.isoformat())};
+    const WORKTIME_DATE_TO = {script_json(date_to.isoformat())};
+    const CHART_COLORS = [
+      "#0f766e",
+      "#2563eb",
+      "#7c3aed",
+      "#dc2626",
+      "#d97706",
+      "#16a34a",
+      "#0891b2",
+      "#be185d",
+      "#4f46e5",
+      "#65a30d",
+    ];
+
+    function getSavedTheme() {{
+      const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+      return ["light", "dark", "system"].includes(savedTheme) ? savedTheme : "system";
+    }}
+
+    function applyTheme(theme) {{
+      document.documentElement.dataset.theme = ["light", "dark", "system"].includes(theme) ? theme : "system";
+    }}
+
+    function formatHours(value) {{
+      if (!value || value <= 0) {{
+        return "-";
+      }}
+      return Number.isInteger(value) ? `${{value}}h` : `${{value.toFixed(2)}}h`;
+    }}
+
+    function appendCell(row, text, className = "") {{
+      const cell = document.createElement("td");
+      cell.textContent = text;
+      if (className) {{
+        cell.className = className;
+      }}
+      row.append(cell);
+      return cell;
+    }}
+
+    function getSelectedWorktimeVersions() {{
+      if (!worktimeVersionAll || worktimeVersionAll.checked) {{
+        return null;
+      }}
+
+      const selected = worktimeVersionCheckboxes
+        .filter((checkbox) => checkbox.checked)
+        .map((checkbox) => checkbox.value);
+      return selected.length ? new Set(selected) : null;
+    }}
+
+    function handleWorktimeVersionAllChange() {{
+      if (!worktimeVersionAll) {{
+        return;
+      }}
+
+      if (worktimeVersionAll.checked) {{
+        worktimeVersionCheckboxes.forEach((checkbox) => {{
+          checkbox.checked = false;
+        }});
+      }} else if (!worktimeVersionCheckboxes.some((checkbox) => checkbox.checked)) {{
+        worktimeVersionAll.checked = true;
+      }}
+      renderRows();
+    }}
+
+    function handleWorktimeVersionCheckboxChange() {{
+      if (!worktimeVersionAll) {{
+        return;
+      }}
+
+      if (worktimeVersionCheckboxes.some((checkbox) => checkbox.checked)) {{
+        worktimeVersionAll.checked = false;
+      }} else {{
+        worktimeVersionAll.checked = true;
+      }}
+      renderRows();
+    }}
+
+    function groupedHours(filteredEntries) {{
+      const groups = new Map();
+      filteredEntries.forEach((entry) => {{
+        const user = entry.user || "-";
+        const issueId = entry.issue_id || "-";
+        const hours = Number(entry.hours || 0);
+        const group = groups.get(user) || {{
+          user,
+          hours: 0,
+          issues: new Map(),
+        }};
+        group.hours += hours;
+        group.issues.set(issueId, (group.issues.get(issueId) || 0) + hours);
+        groups.set(user, group);
+      }});
+      return Array.from(groups.values())
+        .map((group) => ({{
+          user: group.user,
+          hours: group.hours,
+          issues: Array.from(group.issues, ([issueId, hours]) => ({{ issueId, hours }}))
+            .filter((item) => item.hours > 0)
+            .sort((a, b) => b.hours - a.hours || a.issueId.localeCompare(b.issueId, "ja")),
+        }}))
+        .filter((item) => item.hours > 0)
+        .sort((a, b) => b.hours - a.hours || a.user.localeCompare(b.user, "ja"));
+    }}
+
+    function groupedIssueHours(filteredEntries, selectedUser) {{
+      const groups = new Map();
+      filteredEntries.forEach((entry) => {{
+        const issueId = entry.issue_id || "-";
+        const user = entry.user || "-";
+        const label = selectedUser === "__all__" ? `${{user}} / #${{issueId}}` : `#${{issueId}}`;
+        groups.set(label, (groups.get(label) || 0) + Number(entry.hours || 0));
+      }});
+      return Array.from(groups, ([label, hours]) => ({{ label, hours }}))
+        .filter((item) => item.hours > 0)
+        .sort((a, b) => b.hours - a.hours || a.label.localeCompare(b.label, "ja"));
+    }}
+
+    function randomOrderStorageKey() {{
+      return `${{WORKTIME_PROJECT_ID}}|${{WORKTIME_DATE_FROM}}|${{WORKTIME_DATE_TO}}`;
+    }}
+
+    function loadRandomOrderMap() {{
+      try {{
+        const saved = JSON.parse(localStorage.getItem(WORKTIME_RANDOM_ORDER_STORAGE_KEY) || "{{}}");
+        return saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {{}};
+      }} catch {{
+        return {{}};
+      }}
+    }}
+
+    function saveRandomOrder(order) {{
+      const saved = loadRandomOrderMap();
+      saved[randomOrderStorageKey()] = order;
+      localStorage.setItem(WORKTIME_RANDOM_ORDER_STORAGE_KEY, JSON.stringify(saved));
+    }}
+
+    function savedRandomOrder() {{
+      const order = loadRandomOrderMap()[randomOrderStorageKey()];
+      return Array.isArray(order) ? order.filter((name) => typeof name === "string") : [];
+    }}
+
+    function shuffled(values) {{
+      const result = [...values];
+      for (let index = result.length - 1; index > 0; index -= 1) {{
+        const swapIndex = Math.floor(Math.random() * (index + 1));
+        [result[index], result[swapIndex]] = [result[swapIndex], result[index]];
+      }}
+      return result;
+    }}
+
+    function orderedGroupsForBar(groups) {{
+      const order = savedRandomOrder();
+      if (!order.length) {{
+        return groups;
+      }}
+
+      const orderIndex = new Map(order.map((name, index) => [name, index]));
+      const missing = groups
+        .map((item) => item.user)
+        .filter((name) => !orderIndex.has(name));
+      if (missing.length) {{
+        const mergedOrder = [...order, ...shuffled(missing)];
+        saveRandomOrder(mergedOrder);
+        mergedOrder.forEach((name, index) => orderIndex.set(name, index));
+      }}
+
+      return [...groups].sort((a, b) => {{
+        const aIndex = orderIndex.has(a.user) ? orderIndex.get(a.user) : Number.MAX_SAFE_INTEGER;
+        const bIndex = orderIndex.has(b.user) ? orderIndex.get(b.user) : Number.MAX_SAFE_INTEGER;
+        return aIndex - bIndex || a.user.localeCompare(b.user, "ja");
+      }});
+    }}
+
+    function decideRandomOrder(groups) {{
+      const existingOrder = savedRandomOrder();
+      if (existingOrder.length) {{
+        return existingOrder;
+      }}
+
+      const order = shuffled(groups.map((item) => item.user));
+      saveRandomOrder(order);
+      return order;
+    }}
+
+    function renderBarChart(groups, totalHours) {{
+      worktimeChart.replaceChildren();
+      worktimeChart.className = "worktime-chart worktime-bar-chart";
+      if (!groups.length) {{
+        const emptyChart = document.createElement("p");
+        emptyChart.className = "empty-message";
+        emptyChart.textContent = "作業時間はありません。";
+        worktimeChart.append(emptyChart);
+        return;
+      }}
+
+      const orderedGroups = orderedGroupsForBar(groups);
+      const maxHours = Math.max(...groups.map((item) => item.hours), 1);
+      const issueTotals = new Map();
+      orderedGroups.forEach((item) => {{
+        item.issues.forEach((issue) => {{
+          issueTotals.set(issue.issueId, (issueTotals.get(issue.issueId) || 0) + issue.hours);
+        }});
+      }});
+      const issueColorMap = new Map(
+        Array.from(issueTotals, ([issueId, hours]) => ({{ issueId, hours }}))
+          .sort((a, b) => b.hours - a.hours || a.issueId.localeCompare(b.issueId, "ja"))
+          .map((item, index) => [item.issueId, CHART_COLORS[index % CHART_COLORS.length]])
+      );
+      orderedGroups.forEach((item) => {{
+        const row = document.createElement("div");
+        const name = document.createElement("span");
+        const track = document.createElement("span");
+        const value = document.createElement("span");
+        const breakdown = document.createElement("div");
+        const percent = totalHours > 0 ? item.hours / totalHours * 100 : 0;
+
+        row.className = "worktime-bar-row";
+        name.className = "worktime-bar-name";
+        name.textContent = item.user;
+        name.title = item.user;
+        track.className = "worktime-bar-track";
+        item.issues.forEach((issue, index) => {{
+          const segment = document.createElement("span");
+          const color = issueColorMap.get(issue.issueId) || CHART_COLORS[index % CHART_COLORS.length];
+          segment.className = "worktime-bar-segment";
+          segment.style.width = `${{issue.hours / maxHours * 100}}%`;
+          segment.style.background = color;
+          segment.title = `#${{issue.issueId}} ${{formatHours(issue.hours)}}`;
+          track.append(segment);
+        }});
+        value.className = "worktime-chart-value";
+        value.textContent = `${{formatHours(item.hours)}} / ${{percent.toFixed(1)}}%`;
+        breakdown.className = "worktime-bar-breakdown";
+        item.issues.forEach((issue, index) => {{
+          const chip = document.createElement("span");
+          const swatch = document.createElement("i");
+          const color = issueColorMap.get(issue.issueId) || CHART_COLORS[index % CHART_COLORS.length];
+          swatch.className = "worktime-issue-swatch";
+          swatch.style.background = color;
+          chip.style.borderColor = color;
+          chip.append(swatch, `#${{issue.issueId}} ${{formatHours(issue.hours)}}`);
+          breakdown.append(chip);
+        }});
+
+        row.append(name, track, value);
+        row.append(breakdown);
+        worktimeChart.append(row);
+      }});
+    }}
+
+    function renderPieChart(groups, totalHours) {{
+      worktimeChart.replaceChildren();
+      worktimeChart.className = "worktime-chart";
+      if (!groups.length || totalHours <= 0) {{
+        const emptyChart = document.createElement("p");
+        emptyChart.className = "empty-message";
+        emptyChart.textContent = "作業時間はありません。";
+        worktimeChart.append(emptyChart);
+        return;
+      }}
+
+      const layout = document.createElement("div");
+      const pie = document.createElement("div");
+      const center = document.createElement("div");
+      const legend = document.createElement("ul");
+      let current = 0;
+      const segments = groups.map((item, index) => {{
+        const percent = item.hours / totalHours * 100;
+        const start = current;
+        current += percent;
+        const color = CHART_COLORS[index % CHART_COLORS.length];
+        return `${{color}} ${{start.toFixed(3)}}% ${{current.toFixed(3)}}%`;
+      }});
+
+      layout.className = "worktime-pie-layout";
+      pie.className = "worktime-pie";
+      pie.style.background = `conic-gradient(${{segments.join(", ")}})`;
+      center.className = "worktime-pie-center";
+      center.textContent = formatHours(totalHours);
+      legend.className = "worktime-chart-legend";
+
+      groups.forEach((item, index) => {{
+        const percent = item.hours / totalHours * 100;
+        const row = document.createElement("li");
+        const swatch = document.createElement("span");
+        const name = document.createElement("span");
+        const value = document.createElement("span");
+
+        swatch.className = "worktime-swatch";
+        swatch.style.background = CHART_COLORS[index % CHART_COLORS.length];
+        name.textContent = item.label;
+        value.className = "worktime-chart-value";
+        value.textContent = `${{formatHours(item.hours)}} / ${{percent.toFixed(1)}}%`;
+        row.append(swatch, name, value);
+        legend.append(row);
+      }});
+
+      pie.append(center);
+      layout.append(pie, legend);
+      worktimeChart.append(layout);
+    }}
+
+    function renderChart(filteredEntries, totalHours) {{
+      const groups = groupedHours(filteredEntries);
+      if (chartType.value === "pie") {{
+        const pieGroups = userFilter.value === "__all__"
+          ? groups.map((item) => ({{ label: item.user, hours: item.hours }}))
+          : groupedIssueHours(filteredEntries, userFilter.value);
+        renderPieChart(pieGroups, totalHours);
+      }} else {{
+        renderBarChart(groups, totalHours);
+      }}
+    }}
+
+    function renderRows() {{
+      const selectedUser = userFilter.value;
+      const selectedVersions = getSelectedWorktimeVersions();
+      const filtered = entries.filter((entry) => {{
+        const userMatches = selectedUser === "__all__" || entry.user === selectedUser;
+        const versionMatches = selectedVersions === null || selectedVersions.has(entry.version || "-");
+        return userMatches && versionMatches;
+      }});
+      const totalHours = filtered.reduce((total, entry) => total + Number(entry.hours || 0), 0);
+
+      body.replaceChildren();
+      empty.hidden = filtered.length > 0;
+      visibleEntryCount.textContent = filtered.length;
+      visibleEntryHours.textContent = formatHours(totalHours);
+      renderChart(filtered, totalHours);
+
+      filtered.forEach((entry) => {{
+        const row = document.createElement("tr");
+        appendCell(row, entry.spent_on || "-");
+        appendCell(row, entry.user || "-");
+
+        const issueCell = document.createElement("td");
+        if (entry.issue_url) {{
+          const link = document.createElement("a");
+          link.href = entry.issue_url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = `#${{entry.issue_id}}`;
+          issueCell.append(link);
+        }} else {{
+          issueCell.textContent = "-";
+        }}
+        row.append(issueCell);
+
+        appendCell(row, entry.version || "-");
+        appendCell(row, entry.activity || "-");
+        appendCell(row, formatHours(Number(entry.hours || 0)), "hours");
+        appendCell(row, entry.comment || "", "comment");
+        body.append(row);
+      }});
+    }}
+
+    applyTheme(getSavedTheme());
+    window.addEventListener("storage", (event) => {{
+      if (event.key === THEME_STORAGE_KEY) {{
+        applyTheme(getSavedTheme());
+      }}
+    }});
+    const savedChartType = localStorage.getItem(WORKTIME_CHART_STORAGE_KEY);
+    if (["bar", "pie"].includes(savedChartType)) {{
+      chartType.value = savedChartType;
+    }}
+    chartType.addEventListener("change", () => {{
+      localStorage.setItem(WORKTIME_CHART_STORAGE_KEY, chartType.value);
+      renderRows();
+    }});
+    randomOrderButton.addEventListener("click", () => {{
+      decideRandomOrder(groupedHours(entries));
+      chartType.value = "bar";
+      localStorage.setItem(WORKTIME_CHART_STORAGE_KEY, chartType.value);
+      renderRows();
+    }});
+    if (worktimeVersionAll) {{
+      worktimeVersionAll.addEventListener("change", handleWorktimeVersionAllChange);
+    }}
+    worktimeVersionCheckboxes.forEach((checkbox) => {{
+      checkbox.addEventListener("change", handleWorktimeVersionCheckboxChange);
+    }});
+    userFilter.addEventListener("change", renderRows);
+    renderRows();
+  </script>
+</body>
+</html>
+"""
+
+
 def render_combined_html(project_id: str) -> str:
     return f"""<!doctype html>
 <html lang="ja" data-theme="system">
@@ -3081,17 +4300,17 @@ def render_kanban_html(
 
     .filter-controls {{
       display: grid;
-      grid-template-columns: minmax(160px, 200px) minmax(240px, 1fr) minmax(160px, 200px) auto;
+      grid-template-columns: minmax(130px, 180px) minmax(160px, 200px) minmax(240px, 1fr) minmax(160px, 200px) auto;
       align-items: end;
       gap: 12px;
     }}
 
     .project-control {{
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto auto;
+      grid-template-columns: minmax(0, 1fr) repeat(6, auto);
       align-items: end;
       gap: 8px;
-      max-width: 720px;
+      max-width: 980px;
       margin-top: 12px;
     }}
 
@@ -3272,6 +4491,7 @@ def render_kanban_html(
       to {{ transform: rotate(360deg); }}
     }}
 
+    .issue-id-filter,
     .assignee-filter,
     .ball-possession-filter,
     .theme-filter {{
@@ -3282,6 +4502,7 @@ def render_kanban_html(
       font-weight: 700;
     }}
 
+    .issue-id-filter input,
     .assignee-filter select,
     .ball-possession-filter select,
     .theme-filter select {{
@@ -3806,6 +5027,7 @@ def render_kanban_html(
     const PROJECT_ID_HISTORY_STORAGE_KEY = "redmine-kanban-project-id-history";
     const PROJECT_ID_HISTORY_LIMIT = 20;
     const themeSelector = document.getElementById("theme-selector");
+    const issueIdFilter = document.getElementById("issue-id-filter");
     const assigneeFilter = document.getElementById("assignee-filter");
     const ballPossessionFilter = document.getElementById("ball-possession-filter");
     const versionAll = document.getElementById("version-all");
@@ -4035,6 +5257,7 @@ def render_kanban_html(
 
     function saveKanbanFilterState() {{
       const state = {{
+        issueIds: issueIdFilter ? issueIdFilter.value : "",
         assignee: assigneeFilter.value,
         ballPossession: ballPossessionFilter ? ballPossessionFilter.value : "__all__",
         versions: selectedVersionValues(),
@@ -4051,6 +5274,9 @@ def render_kanban_html(
         return;
       }}
 
+      if (issueIdFilter) {{
+        issueIdFilter.value = String(state.issueIds || "");
+      }}
       selectOptionIfExists(assigneeFilter, String(state.assignee || "__all__"));
       if (ballPossessionFilter) {{
         selectOptionIfExists(ballPossessionFilter, String(state.ballPossession || "__all__"));
@@ -4070,6 +5296,18 @@ def render_kanban_html(
           checkbox.checked = false;
         }});
       }}
+    }}
+
+    function selectedIssueIdSet() {{
+      if (!issueIdFilter) {{
+        return null;
+      }}
+
+      const values = issueIdFilter.value
+        .split(/[^0-9]+/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+      return values.length ? new Set(values) : null;
     }}
 
     function cardParticipants(card) {{
@@ -4252,6 +5490,7 @@ def render_kanban_html(
     }}
 
     function applyFilters() {{
+      const selectedIssueIds = selectedIssueIdSet();
       const selectedAssignee = assigneeFilter.value;
       const selectedBallPossession = ballPossessionFilter ? ballPossessionFilter.value : "__all__";
       const selectedVersions = getSelectedVersions();
@@ -4262,10 +5501,11 @@ def render_kanban_html(
         let columnVisibleCount = 0;
 
         column.querySelectorAll(".issue-card").forEach((card) => {{
+          const issueIdMatches = selectedIssueIds === null || selectedIssueIds.has(card.dataset.issueId || "");
           const assigneeMatches = selectedAssignee === "__all__" || cardParticipants(card).includes(selectedAssignee);
           const versionMatches = selectedVersions === null || selectedVersions.has(card.dataset.version);
           const ballPossessionMatches = selectedBallPossession === "__all__" || cardBallPossessionValues(card).includes(selectedBallPossession);
-          const matches = assigneeMatches && versionMatches && ballPossessionMatches;
+          const matches = issueIdMatches && assigneeMatches && versionMatches && ballPossessionMatches;
           card.classList.toggle("is-hidden", !matches);
           if (matches) {{
             columnVisibleCount += 1;
@@ -4332,6 +5572,9 @@ def render_kanban_html(
     }}
 
     function resetFilters() {{
+      if (issueIdFilter) {{
+        issueIdFilter.value = "";
+      }}
       assigneeFilter.value = "__all__";
       if (ballPossessionFilter) {{
         ballPossessionFilter.value = "__all__";
@@ -4367,6 +5610,12 @@ def render_kanban_html(
     }}
 
     restoreKanbanFilterState();
+    if (issueIdFilter) {{
+      issueIdFilter.addEventListener("input", () => {{
+        applyFilters();
+        saveKanbanFilterState();
+      }});
+    }}
     assigneeFilter.addEventListener("change", () => {{
       applyFilters();
       saveKanbanFilterState();
@@ -4404,6 +5653,11 @@ def write_kanban_html(
     )
     combined_path = Path(COMBINED_HTML).resolve()
     combined_path.write_text(render_combined_html(project_id), encoding="utf-8")
+    worktime_path = Path(WORKTIME_HTML).resolve()
+    today = date.today()
+    worktime_path.write_text(
+        render_worktime_html([], redmine_url, project_id, today, today), encoding="utf-8"
+    )
     return output_path
 
 
@@ -4902,7 +6156,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if parsed_url.path not in {"/", f"/{OUTPUT_HTML}", f"/{WORKLOAD_HTML}", f"/{COMBINED_HTML}"}:
+        if parsed_url.path not in {"/", f"/{OUTPUT_HTML}", f"/{WORKLOAD_HTML}", f"/{COMBINED_HTML}", f"/{WORKTIME_HTML}"}:
             self.send_error(404, "Not Found")
             return
 
@@ -4910,6 +6164,8 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             response_path = WORKLOAD_HTML
         elif parsed_url.path == f"/{COMBINED_HTML}":
             response_path = COMBINED_HTML
+        elif parsed_url.path == f"/{WORKTIME_HTML}":
+            response_path = WORKTIME_HTML
         else:
             response_path = OUTPUT_HTML
 
@@ -4928,6 +6184,44 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
 
         try:
             resolved_project_id = resolve_project_id(project_id)
+            if response_path == WORKTIME_HTML:
+                load_env()
+                redmine_url = require_env("REDMINE_URL")
+                api_key = require_env("REDMINE_API_KEY")
+                today = date.today()
+                date_from = parse_worktime_date(query.get("from", [None])[0], today)
+                date_to = parse_worktime_date(query.get("to", [None])[0], today)
+                if date_from > date_to:
+                    date_from, date_to = date_to, date_from
+                entries = fetch_worktime_entries(
+                    redmine_url,
+                    api_key,
+                    resolved_project_id,
+                    date_from,
+                    date_to,
+                )
+                ensure_issue_cache_loaded_from_disk(resolved_project_id)
+                with ISSUE_CACHE_LOCK:
+                    cached_entry = ISSUE_CACHE.get(resolved_project_id)
+                    cached_issues = list(cached_entry.issues) if cached_entry else []
+                response_body = render_worktime_html(
+                    entries,
+                    redmine_url,
+                    resolved_project_id,
+                    date_from,
+                    date_to,
+                    issue_fixed_version_map(cached_issues),
+                )
+                status_code = 200
+                encoded_body = response_body.encode("utf-8")
+                self.send_response(status_code)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded_body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(encoded_body)
+                return
+
             ensure_issue_cache_loaded_from_disk(resolved_project_id)
             with ISSUE_CACHE_LOCK:
                 has_cache = resolved_project_id in ISSUE_CACHE
