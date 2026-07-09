@@ -35,10 +35,12 @@ DEFAULT_TIME_ENTRY_PAGES = 2
 SUB_ASSIGNEE_FIELD_NAME = "副担当者"
 SUB_ASSIGNEE_CACHE_FIELD = "_sub_assignees"
 BALL_POSSESSION_FIELD_NAME = "ボール所持"
+BUG_CATEGORY_FIELD_NAME = "不具合のカテゴリ"
 OUTPUT_HTML = "kanban.html"
 WORKLOAD_HTML = "workload.html"
 COMBINED_HTML = "combined.html"
 WORKTIME_HTML = "worktime.html"
+QUALITY_HTML = "quality.html"
 CACHE_DIR = Path(".cache")
 CACHE_SCHEMA_VERSION = 1
 DEFAULT_SERVE_HOST = "127.0.0.1"
@@ -298,8 +300,24 @@ def custom_field_values(issue: dict[str, Any], field_name: str) -> list[str]:
     return []
 
 
+def has_custom_field(issue: dict[str, Any], field_name: str) -> bool:
+    custom_fields = issue.get("custom_fields")
+    if not isinstance(custom_fields, list):
+        return False
+
+    return any(
+        isinstance(field, dict) and str(field.get("name") or "") == field_name
+        for field in custom_fields
+    )
+
+
 def ball_possession_values(issue: dict[str, Any]) -> list[str]:
     return custom_field_values(issue, BALL_POSSESSION_FIELD_NAME)
+
+
+def bug_category_values(issue: dict[str, Any]) -> list[str]:
+    values = custom_field_values(issue, BUG_CATEGORY_FIELD_NAME)
+    return values or ["未設定"]
 
 
 def format_remaining_work_time(value: str) -> str:
@@ -573,6 +591,58 @@ def fetch_issues(
         issues.extend(pages.get(offset, []))
 
     return issues
+
+
+def possible_value_label_map(possible_values: Any) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    if not isinstance(possible_values, list):
+        return labels
+
+    for item in possible_values:
+        if isinstance(item, dict):
+            label = item.get("label") or item.get("name") or item.get("value")
+            for key_name in ("value", "id"):
+                key = item.get(key_name)
+                if key not in (None, "") and label not in (None, ""):
+                    labels[str(key)] = str(label)
+        elif item not in (None, ""):
+            labels[str(item)] = str(item)
+    return labels
+
+
+def fetch_custom_field_value_labels(
+    redmine_url: str,
+    api_key: str,
+    field_name: str,
+) -> dict[str, str]:
+    endpoint = urljoin(redmine_url.rstrip("/") + "/", "custom_fields.json")
+    request = Request(endpoint, headers={"X-Redmine-API-Key": api_key})
+
+    try:
+        with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            data = json.load(response)
+    except (HTTPError, TimeoutError, URLError, json.JSONDecodeError) as exc:
+        print(
+            f"[server] カスタムフィールド定義を取得できませんでした: field={field_name}, {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    custom_fields = data.get("custom_fields")
+    if not isinstance(custom_fields, list):
+        return {}
+
+    for field in custom_fields:
+        if not isinstance(field, dict):
+            continue
+        if str(field.get("name") or "") != field_name:
+            continue
+        return possible_value_label_map(field.get("possible_values"))
+    return {}
 
 
 def fetch_user_name(redmine_url: str, api_key: str, user_id: str) -> str | None:
@@ -1030,6 +1100,7 @@ def render_project_control(project_id: str) -> str:
           <button class="control-action control-action-refresh" type="submit" name="refresh_mode" value="full" formmethod="post" formaction="/refresh">全更新</button>
           <a class="control-link control-link-workload" href="/{WORKLOAD_HTML}" target="_top">作業負荷状況</a>
           <a class="control-link control-link-worktime" href="/{WORKTIME_HTML}" target="_blank" rel="noopener noreferrer">作業時間</a>
+          <a class="control-link control-link-quality" href="/{QUALITY_HTML}" target="_top">品質改善</a>
           <a class="control-link control-link-combined" href="/{COMBINED_HTML}" target="_top">同時表示</a>
           <span class="refresh-status" id="refresh-status" role="status" aria-live="polite"></span>
         </form>"""
@@ -2713,6 +2784,15 @@ def parse_worktime_date(value: str | None, fallback: date) -> date:
         return fallback
 
 
+def add_months(value: date, months: int) -> date:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    next_month = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    last_day = (next_month - timedelta(days=1)).day
+    return date(year, month, min(value.day, last_day))
+
+
 def time_entry_issue_id(entry: dict[str, Any]) -> str:
     issue = entry.get("issue")
     if isinstance(issue, dict) and issue.get("id") not in (None, ""):
@@ -2741,6 +2821,16 @@ def issue_fixed_version_map(issues: list[dict[str, Any]]) -> dict[str, str]:
     return versions
 
 
+def issue_subject_map(issues: list[dict[str, Any]]) -> dict[str, str]:
+    subjects: dict[str, str] = {}
+    for issue in issues:
+        issue_id = issue.get("id")
+        if issue_id in (None, ""):
+            continue
+        subjects[str(issue_id)] = str(issue.get("subject") or "-")
+    return subjects
+
+
 def render_worktime_html(
     entries: list[dict[str, Any]],
     redmine_url: str,
@@ -2748,8 +2838,10 @@ def render_worktime_html(
     date_from: date,
     date_to: date,
     issue_versions: dict[str, str] | None = None,
+    issue_subjects: dict[str, str] | None = None,
 ) -> str:
     issue_versions = issue_versions or {}
+    issue_subjects = issue_subjects or {}
     users = sorted({time_entry_user_name(entry) for entry in entries if time_entry_user_name(entry) != "-"})
     user_options = ['<option value="__all__">全員</option>']
     user_options.extend(
@@ -2767,6 +2859,7 @@ def render_worktime_html(
                 "issue_url": f"{redmine_url.rstrip('/')}/issues/{issue_id}"
                 if issue_id != "-"
                 else "",
+                "issue_subject": issue_subjects.get(issue_id, "-"),
                 "version": issue_versions.get(issue_id, unset_version),
                 "activity": time_entry_activity(entry),
                 "hours": time_entry_hours_value(entry),
@@ -3387,6 +3480,23 @@ def render_worktime_html(
       text-decoration: none;
     }}
 
+    .worktime-issue-cell {{
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      min-width: 240px;
+    }}
+
+    .worktime-issue-cell a {{
+      flex: 0 0 auto;
+    }}
+
+    .worktime-issue-subject {{
+      color: var(--text-color);
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }}
+
     .comment {{
       overflow-wrap: anywhere;
       white-space: pre-wrap;
@@ -3962,6 +4072,7 @@ def render_worktime_html(
         appendCell(row, entry.user || "-");
 
         const issueCell = document.createElement("td");
+        issueCell.className = "worktime-issue-cell";
         if (entry.issue_url) {{
           const link = document.createElement("a");
           link.href = entry.issue_url;
@@ -3971,6 +4082,12 @@ def render_worktime_html(
           issueCell.append(link);
         }} else {{
           issueCell.textContent = "-";
+        }}
+        if (entry.issue_subject && entry.issue_subject !== "-") {{
+          const subject = document.createElement("span");
+          subject.className = "worktime-issue-subject";
+          subject.textContent = entry.issue_subject;
+          issueCell.append(subject);
         }}
         row.append(issueCell);
 
@@ -4022,6 +4139,623 @@ def render_worktime_html(
     }});
     userFilter.addEventListener("change", renderRows);
     renderRows();
+  </script>
+</body>
+</html>
+"""
+
+
+def issue_quality_date(issue: dict[str, Any], date_basis: str) -> date | None:
+    primary_field = "created_on" if date_basis == "created" else "updated_on"
+    fallback_field = "updated_on" if date_basis == "created" else "created_on"
+    issue_datetime = parse_datetime(issue.get(primary_field)) or parse_datetime(issue.get(fallback_field))
+    return issue_datetime.date() if issue_datetime else None
+
+
+def quality_issue_rows(
+    issues: list[dict[str, Any]],
+    redmine_url: str,
+    date_from: date,
+    date_to: date,
+    category_labels: dict[str, str] | None = None,
+    date_basis: str = "updated",
+) -> list[dict[str, Any]]:
+    category_labels = category_labels or {}
+    rows: list[dict[str, Any]] = []
+    for issue in issues:
+        if not has_custom_field(issue, BUG_CATEGORY_FIELD_NAME):
+            continue
+        issue_date = issue_quality_date(issue, date_basis)
+        if issue_date is None or issue_date < date_from or issue_date > date_to:
+            continue
+        created_date = parse_datetime(issue.get("created_on"))
+        updated_date = parse_datetime(issue.get("updated_on"))
+        categories = [
+            category_labels.get(category, category)
+            for category in bug_category_values(issue)
+        ]
+        categories = [category for category in categories if category != "未設定"]
+        if not categories:
+            continue
+        rows.append(
+            {
+                "date": issue_date,
+                "created_date": created_date.date().isoformat() if created_date else "-",
+                "updated_date": updated_date.date().isoformat() if updated_date else "-",
+                "id": str(issue.get("id") or "-"),
+                "url": issue_url(issue, redmine_url),
+                "subject": str(issue.get("subject") or "-"),
+                "tracker": issue_field(issue, "tracker"),
+                "status": issue_field(issue, "status"),
+                "assignee": assignee_name(issue),
+                "version": fixed_version_name(issue),
+                "categories": categories,
+                "category_text": ", ".join(categories),
+            }
+        )
+    return sorted(rows, key=lambda item: (item["date"], item["id"]), reverse=True)
+
+
+def quality_category_counts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        for category in row["categories"]:
+            if category == "未設定":
+                continue
+            counts[category] = counts.get(category, 0) + 1
+    return [
+        {"category": category, "count": count}
+        for category, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+
+def fiscal_quarter_periods(today: date) -> list[tuple[str, date, date]]:
+    fiscal_year = today.year if today.month >= 4 else today.year - 1
+    quarter_specs = [
+        ("1Q", fiscal_year, 4, 6),
+        ("2Q", fiscal_year, 7, 9),
+        ("3Q", fiscal_year, 10, 12),
+        ("4Q", fiscal_year + 1, 1, 3),
+    ]
+    periods: list[tuple[str, date, date]] = []
+
+    for label, year, start_month, end_month in quarter_specs:
+        start = date(year, start_month, 1)
+        next_month = date(year + 1, 1, 1) if end_month == 12 else date(year, end_month + 1, 1)
+        end = next_month - timedelta(days=1)
+        if end > today:
+            start = date(start.year - 1, start.month, start.day)
+            end = date(end.year - 1, end.month, end.day)
+        periods.append((label, start, end))
+
+    return periods
+
+
+def render_quality_html(
+    issues: list[dict[str, Any]],
+    redmine_url: str,
+    project_id: str,
+    date_from: date,
+    date_to: date,
+    category_labels: dict[str, str] | None = None,
+    date_basis: str = "updated",
+) -> str:
+    date_basis = "created" if date_basis == "created" else "updated"
+    rows = quality_issue_rows(issues, redmine_url, date_from, date_to, category_labels, date_basis)
+    category_counts = quality_category_counts(rows)
+    chart_rows = [{"category": "全体", "count": len(rows), "is_total": True}, *category_counts]
+    max_count = max(1, *(item["count"] for item in chart_rows))
+    quarter_links_html = "\n".join(
+        f"""
+          <a class="preset-link" href="/{QUALITY_HTML}?{urlencode({'from': start.isoformat(), 'to': end.isoformat(), 'basis': date_basis})}">{escape_text(label)} <span>{escape_text(start.isoformat())} - {escape_text(end.isoformat())}</span></a>"""
+        for label, start, end in fiscal_quarter_periods(date.today())
+    )
+
+    chart_html = "\n".join(
+        f"""
+        <div class="quality-bar-row{' is-total' if item.get('is_total') else ''}">
+          <span class="quality-bar-name">{escape_text(item["category"])}</span>
+          <span class="quality-bar-track"><span style="width: {item["count"] / max_count * 100:.2f}%"></span></span>
+          <strong>{item["count"]}件</strong>
+        </div>"""
+        for item in chart_rows
+    ) or '<p class="empty-message">対象チケットはありません。</p>'
+
+    table_rows = "\n".join(
+        f"""
+          <tr>
+            <td>{escape_text(row["date"].isoformat())}</td>
+            <td>{escape_text(row["created_date"])}</td>
+            <td>{escape_text(row["updated_date"])}</td>
+            <td class="issue-cell">
+              <a href="{escape_text(row["url"])}" target="_blank" rel="noopener noreferrer">#{escape_text(row["id"])}</a>
+              <span>{escape_text(row["subject"])}</span>
+            </td>
+            <td>{escape_text(row["category_text"])}</td>
+            <td>{escape_text(row["tracker"])}</td>
+            <td>{escape_text(row["status"])}</td>
+            <td>{escape_text(row["assignee"])}</td>
+            <td>{escape_text(row["version"])}</td>
+          </tr>"""
+        for row in rows
+    )
+    if not table_rows:
+        table_rows = """
+          <tr>
+            <td colspan="7" class="empty-message">対象チケットはありません。</td>
+          </tr>"""
+
+    return f"""<!doctype html>
+<html lang="ja" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>品質改善 - Redmine Kanban</title>
+  <style>
+    * {{
+      box-sizing: border-box;
+    }}
+
+    :root {{
+      color-scheme: light;
+      --bg-color: #f6f7f9;
+      --text-color: #1f2937;
+      --muted-text: #64748b;
+      --panel-bg: #ffffff;
+      --panel-border: #d8dee8;
+      --control-bg: #ffffff;
+      --control-border: #9ca3af;
+      --control-text: #111827;
+      --button-bg: #be123c;
+      --button-hover-bg: #9f1239;
+      --button-text: #ffffff;
+      --link-color: #be123c;
+      --row-bg: #f8fafc;
+      --bar-bg: #fee2e2;
+      --bar-fill: #be123c;
+    }}
+
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        color-scheme: dark;
+        --bg-color: #0f172a;
+        --text-color: #e5e7eb;
+        --muted-text: #cbd5e1;
+        --panel-bg: #111827;
+        --panel-border: #374151;
+        --control-bg: #0f172a;
+        --control-border: #475569;
+        --control-text: #f9fafb;
+        --button-bg: #be123c;
+        --button-hover-bg: #e11d48;
+        --button-text: #ffffff;
+        --link-color: #fb7185;
+        --row-bg: #172033;
+        --bar-bg: #3f1624;
+        --bar-fill: #fb7185;
+      }}
+    }}
+
+    html[data-theme="light"] {{
+      color-scheme: light;
+      --bg-color: #f6f7f9;
+      --text-color: #1f2937;
+      --muted-text: #64748b;
+      --panel-bg: #ffffff;
+      --panel-border: #d8dee8;
+      --control-bg: #ffffff;
+      --control-border: #9ca3af;
+      --control-text: #111827;
+      --button-bg: #be123c;
+      --button-hover-bg: #9f1239;
+      --button-text: #ffffff;
+      --link-color: #be123c;
+      --row-bg: #f8fafc;
+      --bar-bg: #fee2e2;
+      --bar-fill: #be123c;
+    }}
+
+    html[data-theme="dark"] {{
+      color-scheme: dark;
+      --bg-color: #0f172a;
+      --text-color: #e5e7eb;
+      --muted-text: #cbd5e1;
+      --panel-bg: #111827;
+      --panel-border: #374151;
+      --control-bg: #0f172a;
+      --control-border: #475569;
+      --control-text: #f9fafb;
+      --button-bg: #be123c;
+      --button-hover-bg: #e11d48;
+      --button-text: #ffffff;
+      --link-color: #fb7185;
+      --row-bg: #172033;
+      --bar-bg: #3f1624;
+      --bar-fill: #fb7185;
+    }}
+
+    body {{
+      margin: 0;
+      color: var(--text-color);
+      background: var(--bg-color);
+      font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }}
+
+    .page-header {{
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: center;
+      padding: 16px 20px;
+      background: color-mix(in srgb, var(--bg-color) 94%, transparent);
+      border-bottom: 1px solid var(--panel-border);
+      backdrop-filter: blur(10px);
+    }}
+
+    .page-header h1 {{
+      margin: 0 0 4px;
+      font-size: 22px;
+    }}
+
+    .page-header p {{
+      margin: 0;
+      color: var(--muted-text);
+      font-size: 13px;
+    }}
+
+    .button {{
+      display: inline-flex;
+      min-height: 34px;
+      align-items: center;
+      justify-content: center;
+      padding: 7px 11px;
+      color: var(--button-text);
+      background: var(--button-bg);
+      border: 1px solid var(--button-bg);
+      border-radius: 8px;
+      text-decoration: none;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+
+    .button:hover {{
+      background: var(--button-hover-bg);
+      border-color: var(--button-hover-bg);
+    }}
+
+    main {{
+      display: grid;
+      gap: 14px;
+      padding: 16px 20px 24px;
+    }}
+
+    .panel {{
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+
+    .filters {{
+      display: flex;
+      gap: 10px;
+      align-items: end;
+      flex-wrap: wrap;
+      padding: 14px;
+    }}
+
+    .preset-links {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 0 14px 14px;
+    }}
+
+    .preset-link {{
+      display: inline-flex;
+      min-height: 30px;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      color: var(--control-text);
+      background: var(--row-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      text-decoration: none;
+    }}
+
+    .preset-link span {{
+      color: var(--muted-text);
+      font-weight: 700;
+    }}
+
+    .preset-link:hover {{
+      border-color: var(--link-color);
+    }}
+
+    label {{
+      display: grid;
+      gap: 4px;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    input {{
+      min-height: 34px;
+      padding: 6px 9px;
+      color: var(--control-text);
+      background: var(--control-bg);
+      border: 1px solid var(--control-border);
+      border-radius: 8px;
+      font: inherit;
+      font-weight: 700;
+    }}
+
+    .date-basis-filter {{
+      margin: 0;
+      padding: 7px 9px;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+    }}
+
+    .date-basis-filter legend {{
+      padding: 0 4px;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .date-basis-options {{
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }}
+
+    .date-basis-options label {{
+      display: inline-flex;
+      gap: 5px;
+      align-items: center;
+      color: var(--control-text);
+      white-space: nowrap;
+    }}
+
+    .summary {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(130px, 1fr));
+      gap: 10px;
+      padding: 0 14px 14px;
+    }}
+
+    .summary-card {{
+      padding: 10px;
+      background: var(--row-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+    }}
+
+    .summary-card span {{
+      display: block;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .summary-card strong {{
+      display: block;
+      margin-top: 6px;
+      font-size: 22px;
+    }}
+
+    .quality-bars {{
+      display: grid;
+      gap: 10px;
+      padding: 14px;
+    }}
+
+    .quality-bar-row {{
+      display: grid;
+      grid-template-columns: minmax(130px, 220px) minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      font-size: 13px;
+      font-weight: 800;
+    }}
+
+    .quality-bar-row.is-total {{
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--panel-border);
+    }}
+
+    .quality-bar-name {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+
+    .quality-bar-track {{
+      height: 18px;
+      overflow: hidden;
+      background: var(--bar-bg);
+      border-radius: 999px;
+    }}
+
+    .quality-bar-track span {{
+      display: block;
+      min-width: 2px;
+      height: 100%;
+      background: var(--bar-fill);
+      border-radius: inherit;
+    }}
+
+    .table-wrap {{
+      overflow: auto;
+    }}
+
+    table {{
+      width: 100%;
+      min-width: 980px;
+      border-collapse: collapse;
+    }}
+
+    th,
+    td {{
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--panel-border);
+      text-align: left;
+      font-size: 13px;
+      vertical-align: top;
+    }}
+
+    th {{
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 900;
+      white-space: nowrap;
+    }}
+
+    a {{
+      color: var(--link-color);
+      font-weight: 800;
+      text-decoration: none;
+    }}
+
+    .issue-cell {{
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      min-width: 260px;
+    }}
+
+    .issue-cell a {{
+      flex: 0 0 auto;
+    }}
+
+    .issue-cell span {{
+      overflow-wrap: anywhere;
+      font-weight: 700;
+    }}
+
+    .empty-message {{
+      padding: 18px;
+      color: var(--muted-text);
+      text-align: center;
+      font-weight: 700;
+    }}
+
+    @media (max-width: 760px) {{
+      .page-header {{
+        display: grid;
+      }}
+
+      .summary,
+      .quality-bar-row {{
+        grid-template-columns: 1fr;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <header class="page-header">
+    <div>
+      <h1>品質改善</h1>
+      <p>PROJECT_ID: {escape_text(project_id)} / {escape_text(BUG_CATEGORY_FIELD_NAME)} 別の発生状況</p>
+    </div>
+    <a class="button" href="/{OUTPUT_HTML}" target="_top">かんばん</a>
+  </header>
+  <main>
+    <section class="panel">
+      <form class="filters" action="/{QUALITY_HTML}" method="get">
+        <label>
+          <span>開始日</span>
+          <input type="date" name="from" value="{escape_text(date_from.isoformat())}">
+        </label>
+        <label>
+          <span>終了日</span>
+          <input type="date" name="to" value="{escape_text(date_to.isoformat())}">
+        </label>
+        <fieldset class="date-basis-filter">
+          <legend>対象日付</legend>
+          <div class="date-basis-options">
+            <label>
+              <input type="radio" name="basis" value="updated"{' checked' if date_basis == 'updated' else ''}>
+              <span>更新日</span>
+            </label>
+            <label>
+              <input type="radio" name="basis" value="created"{' checked' if date_basis == 'created' else ''}>
+              <span>作成日</span>
+            </label>
+          </div>
+        </fieldset>
+        <button class="button" type="submit">表示</button>
+      </form>
+      <div class="preset-links" aria-label="四半期プリセット">
+{quarter_links_html}
+      </div>
+      <div class="summary" aria-label="品質改善サマリー">
+        <article class="summary-card">
+          <span>対象チケット</span>
+          <strong>{len(rows)}</strong>
+        </article>
+        <article class="summary-card">
+          <span>カテゴリ数</span>
+          <strong>{len(category_counts)}</strong>
+        </article>
+        <article class="summary-card">
+          <span>対象期間</span>
+          <strong>{escape_text(date_from.isoformat())} - {escape_text(date_to.isoformat())}</strong>
+        </article>
+      </div>
+    </section>
+    <section class="panel quality-bars" aria-label="カテゴリ別件数">
+{chart_html}
+    </section>
+    <section class="panel">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">対象日付</th>
+              <th scope="col">作成日</th>
+              <th scope="col">更新日</th>
+              <th scope="col">Issue</th>
+              <th scope="col">不具合のカテゴリ</th>
+              <th scope="col">トラッカー</th>
+              <th scope="col">ステータス</th>
+              <th scope="col">担当者</th>
+              <th scope="col">対象バージョン</th>
+            </tr>
+          </thead>
+          <tbody>
+{table_rows}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script>
+    const THEME_STORAGE_KEY = "redmine-kanban-theme";
+    function getSavedTheme() {{
+      const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+      return ["light", "dark", "system"].includes(savedTheme) ? savedTheme : "system";
+    }}
+    function applyTheme(theme) {{
+      document.documentElement.dataset.theme = ["light", "dark", "system"].includes(theme) ? theme : "system";
+    }}
+    applyTheme(getSavedTheme());
+    window.addEventListener("storage", (event) => {{
+      if (event.key === THEME_STORAGE_KEY) {{
+        applyTheme(getSavedTheme());
+      }}
+    }});
   </script>
 </body>
 </html>
@@ -4501,10 +5235,10 @@ def render_kanban_html(
 
     .project-control {{
       display: grid;
-      grid-template-columns: minmax(0, 1fr) repeat(6, auto);
+      grid-template-columns: minmax(0, 1fr) repeat(7, auto);
       align-items: end;
       gap: 8px;
-      max-width: 980px;
+      max-width: 1100px;
       margin-top: 12px;
     }}
 
@@ -4689,6 +5423,16 @@ def render_kanban_html(
     .project-control .control-link-worktime:hover {{
       background: #6d28d9;
       border-color: #6d28d9;
+    }}
+
+    .project-control .control-link-quality {{
+      background: #be123c;
+      border-color: #be123c;
+    }}
+
+    .project-control .control-link-quality:hover {{
+      background: #9f1239;
+      border-color: #9f1239;
     }}
 
     .project-control .control-link-combined {{
@@ -5902,6 +6646,11 @@ def write_kanban_html(
     worktime_path.write_text(
         render_worktime_html([], redmine_url, project_id, today, today), encoding="utf-8"
     )
+    quality_path = Path(QUALITY_HTML).resolve()
+    quality_path.write_text(
+        render_quality_html(issues, redmine_url, project_id, add_months(today, -3), today),
+        encoding="utf-8",
+    )
     return output_path
 
 
@@ -6400,7 +7149,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if parsed_url.path not in {"/", f"/{OUTPUT_HTML}", f"/{WORKLOAD_HTML}", f"/{COMBINED_HTML}", f"/{WORKTIME_HTML}"}:
+        if parsed_url.path not in {"/", f"/{OUTPUT_HTML}", f"/{WORKLOAD_HTML}", f"/{COMBINED_HTML}", f"/{WORKTIME_HTML}", f"/{QUALITY_HTML}"}:
             self.send_error(404, "Not Found")
             return
 
@@ -6410,6 +7159,8 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             response_path = COMBINED_HTML
         elif parsed_url.path == f"/{WORKTIME_HTML}":
             response_path = WORKTIME_HTML
+        elif parsed_url.path == f"/{QUALITY_HTML}":
+            response_path = QUALITY_HTML
         else:
             response_path = OUTPUT_HTML
 
@@ -6455,6 +7206,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                     date_from,
                     date_to,
                     issue_fixed_version_map(cached_issues),
+                    issue_subject_map(cached_issues),
                 )
                 status_code = 200
                 encoded_body = response_body.encode("utf-8")
@@ -6504,6 +7256,34 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             if response_path == WORKLOAD_HTML:
                 response_body = render_workload_status_html(
                     visible_issues, redmine_url, resolved_project_id
+                )
+            elif response_path == QUALITY_HTML:
+                today = date.today()
+                date_from = parse_worktime_date(query.get("from", [None])[0], add_months(today, -3))
+                date_to = parse_worktime_date(query.get("to", [None])[0], today)
+                if date_from > date_to:
+                    date_from, date_to = date_to, date_from
+                date_basis = query.get("basis", ["updated"])[0]
+                if date_basis not in {"updated", "created"}:
+                    date_basis = "updated"
+                with ISSUE_CACHE_LOCK:
+                    cached_entry = ISSUE_CACHE.get(resolved_project_id)
+                    quality_issues = list(cached_entry.issues) if cached_entry else visible_issues
+                load_env()
+                api_key = os.getenv("REDMINE_API_KEY")
+                category_labels = (
+                    fetch_custom_field_value_labels(redmine_url, api_key, BUG_CATEGORY_FIELD_NAME)
+                    if api_key
+                    else {}
+                )
+                response_body = render_quality_html(
+                    quality_issues,
+                    redmine_url,
+                    resolved_project_id,
+                    date_from,
+                    date_to,
+                    category_labels,
+                    date_basis,
                 )
             elif response_path == COMBINED_HTML:
                 response_body = render_combined_html(resolved_project_id)
