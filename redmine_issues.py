@@ -593,6 +593,70 @@ def fetch_issues(
     return issues
 
 
+def fetch_issue(redmine_url: str, api_key: str, issue_id: str) -> dict[str, Any] | None:
+    if not issue_id or issue_id == "-":
+        return None
+    endpoint = urljoin(redmine_url.rstrip("/") + "/", f"issues/{issue_id}.json")
+    request = Request(endpoint, headers={"X-Redmine-API-Key": api_key})
+    try:
+        with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            data = json.load(response)
+    except (HTTPError, TimeoutError, URLError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    issue = data.get("issue")
+    return issue if isinstance(issue, dict) else None
+
+
+def fetch_projects(redmine_url: str, api_key: str) -> list[dict[str, str]]:
+    endpoint = urljoin(redmine_url.rstrip("/") + "/", "projects.json")
+    projects: list[dict[str, str]] = []
+    offset = 0
+
+    while True:
+        params = {
+            "limit": PAGE_LIMIT,
+            "offset": offset,
+        }
+        request = Request(
+            f"{endpoint}?{urlencode(params)}",
+            headers={"X-Redmine-API-Key": api_key},
+        )
+        try:
+            with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+                data = json.load(response)
+        except (HTTPError, TimeoutError, URLError, json.JSONDecodeError):
+            return projects
+
+        if not isinstance(data, dict):
+            return projects
+        page_projects = data.get("projects")
+        if not isinstance(page_projects, list):
+            return projects
+
+        for project in page_projects:
+            if not isinstance(project, dict):
+                continue
+            identifier = str(project.get("identifier") or "").strip()
+            if not identifier:
+                continue
+            projects.append(
+                {
+                    "id": identifier,
+                    "name": str(project.get("name") or identifier),
+                }
+            )
+
+        try:
+            total_count = int(data.get("total_count", len(projects)))
+        except (TypeError, ValueError):
+            return projects
+        offset += PAGE_LIMIT
+        if offset >= total_count or not page_projects:
+            return projects
+
+
 def possible_value_label_map(possible_values: Any) -> dict[str, str]:
     labels: dict[str, str] = {}
     if not isinstance(possible_values, list):
@@ -3497,6 +3561,10 @@ def render_worktime_html(
       overflow-wrap: anywhere;
     }}
 
+    .worktime-activity-cell {{
+      font-weight: 900;
+    }}
+
     .comment {{
       overflow-wrap: anywhere;
       white-space: pre-wrap;
@@ -3867,6 +3935,23 @@ def render_worktime_html(
       }};
     }}
 
+    function partColorMapForGroups(groups) {{
+      const parts = new Map();
+      groups.forEach((group) => {{
+        group.parts.forEach((part) => {{
+          const existing = parts.get(part.key) || {{ key: part.key, label: part.label, hours: 0 }};
+          existing.hours += part.hours;
+          parts.set(part.key, existing);
+        }});
+      }});
+      return new Map(
+        Array.from(parts.values())
+          .filter((item) => item.hours > 0)
+          .sort((a, b) => b.hours - a.hours || a.label.localeCompare(b.label, "ja"))
+          .map((item, index) => [item.key, CHART_COLORS[index % CHART_COLORS.length]])
+      );
+    }}
+
     function renderBarChart(groups, totalHours) {{
       worktimeChart.replaceChildren();
       worktimeChart.className = "worktime-chart worktime-bar-chart";
@@ -3881,11 +3966,7 @@ def render_worktime_html(
       const totalGroup = totalGroupForBar(groups);
       const orderedGroups = [totalGroup, ...orderedGroupsForBar(groups)];
       const maxHours = Math.max(...orderedGroups.map((item) => item.hours), 1);
-      const partColorMap = new Map(
-        totalGroup.parts
-          .sort((a, b) => b.hours - a.hours || a.label.localeCompare(b.label, "ja"))
-          .map((item, index) => [item.key, CHART_COLORS[index % CHART_COLORS.length]])
-      );
+      const partColorMap = partColorMapForGroups(groups);
       orderedGroups.forEach((item) => {{
         const row = document.createElement("div");
         const name = document.createElement("span");
@@ -4065,6 +4146,10 @@ def render_worktime_html(
       visibleEntryCount.textContent = filtered.length;
       visibleEntryHours.textContent = formatHours(totalHours);
       renderChart(filtered, totalHours);
+      const breakdownType = currentBreakdownType();
+      const activityColorMap = breakdownType === "activity"
+        ? partColorMapForGroups(groupedHours(filtered, "activity"))
+        : new Map();
 
       filtered.forEach((entry) => {{
         const row = document.createElement("tr");
@@ -4092,7 +4177,14 @@ def render_worktime_html(
         row.append(issueCell);
 
         appendCell(row, entry.version || "-");
-        appendCell(row, entry.activity || "-");
+        const activityCell = appendCell(row, entry.activity || "-");
+        if (breakdownType === "activity") {{
+          const activityColor = activityColorMap.get(entry.activity || "-");
+          if (activityColor) {{
+            activityCell.classList.add("worktime-activity-cell");
+            activityCell.style.color = activityColor;
+          }}
+        }}
         appendCell(row, formatHours(Number(entry.hours || 0)), "hours");
         appendCell(row, entry.comment || "", "comment");
         body.append(row);
@@ -4158,7 +4250,7 @@ def quality_issue_rows(
     date_from: date,
     date_to: date,
     category_labels: dict[str, str] | None = None,
-    date_basis: str = "updated",
+    date_basis: str = "created",
 ) -> list[dict[str, Any]]:
     category_labels = category_labels or {}
     rows: list[dict[str, Any]] = []
@@ -4231,6 +4323,107 @@ def fiscal_quarter_periods(today: date) -> list[tuple[str, date, date]]:
     return periods
 
 
+def fiscal_quarter_period(fiscal_year: int, quarter: int) -> tuple[str, date, date]:
+    quarter_start_months = {1: 4, 2: 7, 3: 10, 4: 1}
+    start_year = fiscal_year + 1 if quarter == 4 else fiscal_year
+    start = date(start_year, quarter_start_months[quarter], 1)
+    end_month = start.month + 3
+    end_year = start.year
+    if end_month > 12:
+        end_month -= 12
+        end_year += 1
+    end = date(end_year, end_month, 1) - timedelta(days=1)
+    return f"{fiscal_year} {quarter}Q", start, end
+
+
+def fiscal_quarter_for_date(target_date: date) -> tuple[int, int]:
+    if target_date.month >= 4:
+        return target_date.year, ((target_date.month - 4) // 3) + 1
+    return target_date.year - 1, 4
+
+
+def recent_fiscal_quarter_periods(today: date, count: int = 8) -> list[tuple[str, date, date]]:
+    fiscal_year, quarter = fiscal_quarter_for_date(today)
+    periods: list[tuple[str, date, date]] = []
+    for _ in range(count):
+        periods.append(fiscal_quarter_period(fiscal_year, quarter))
+        quarter -= 1
+        if quarter < 1:
+            fiscal_year -= 1
+            quarter = 4
+    return periods
+
+
+def quality_count_map(rows: list[dict[str, Any]]) -> dict[str, int]:
+    return {str(item["category"]): int(item["count"]) for item in quality_category_counts(rows)}
+
+
+def quality_issue_total_counts_by_version(
+    issues: list[dict[str, Any]],
+    date_from: date,
+    date_to: date,
+    date_basis: str,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    seen_issue_ids: set[Any] = set()
+    for issue in issues:
+        issue_id = issue.get("id")
+        if issue_id in seen_issue_ids:
+            continue
+        seen_issue_ids.add(issue_id)
+        issue_date = issue_quality_date(issue, date_basis)
+        if issue_date is None or issue_date < date_from or issue_date > date_to:
+            continue
+        version = fixed_version_name(issue)
+        counts[version] = counts.get(version, 0) + 1
+    return counts
+
+
+def quality_bug_counts_by_version(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    seen_issue_ids: set[str] = set()
+    for row in rows:
+        issue_id = str(row.get("id") or "")
+        if issue_id in seen_issue_ids:
+            continue
+        seen_issue_ids.add(issue_id)
+        version = str(row.get("version") or "未設定")
+        counts[version] = counts.get(version, 0) + 1
+    return counts
+
+
+def quality_rate_text(bug_count: int, total_count: int) -> str:
+    if total_count <= 0:
+        return "-"
+    return f"{bug_count / total_count * 100:.1f}%"
+
+
+def quality_rate_value(bug_count: int, total_count: int) -> float | None:
+    if total_count <= 0:
+        return None
+    return bug_count / total_count * 100
+
+
+def quality_rate_point_delta_text(rate_a: float | None, rate_b: float | None) -> str:
+    if rate_a is None or rate_b is None:
+        return "-"
+    return f"{rate_b - rate_a:+.1f}pt"
+
+
+def quality_delta_rate_text(count_a: int, count_b: int) -> str:
+    if count_a == 0:
+        return "新規" if count_b > 0 else "0.0%"
+    return f"{((count_b - count_a) / count_a) * 100:+.1f}%"
+
+
+def quality_delta_class(delta: int) -> str:
+    if delta > 0:
+        return "is-increase"
+    if delta < 0:
+        return "is-decrease"
+    return "is-flat"
+
+
 def render_quality_html(
     issues: list[dict[str, Any]],
     redmine_url: str,
@@ -4238,21 +4431,109 @@ def render_quality_html(
     date_from: date,
     date_to: date,
     category_labels: dict[str, str] | None = None,
-    date_basis: str = "updated",
+    date_basis: str = "created",
+    compare_mode: bool = False,
+    compare_from: date | None = None,
+    compare_to: date | None = None,
+    available_projects: list[dict[str, str]] | None = None,
 ) -> str:
     date_basis = "created" if date_basis == "created" else "updated"
+    period_a_from = compare_from or date_from
+    period_a_to = compare_to or date_to
     rows = quality_issue_rows(issues, redmine_url, date_from, date_to, category_labels, date_basis)
+    compare_rows = quality_issue_rows(
+        issues,
+        redmine_url,
+        period_a_from,
+        period_a_to,
+        category_labels,
+        date_basis,
+    )
+    period_b_rows = rows
     category_counts = quality_category_counts(rows)
     chart_rows = [{"category": "全体", "count": len(rows), "is_total": True}, *category_counts]
+    version_total_counts = quality_issue_total_counts_by_version(issues, date_from, date_to, date_basis)
+    compare_version_total_counts = quality_issue_total_counts_by_version(
+        issues,
+        period_a_from,
+        period_a_to,
+        date_basis,
+    )
+    version_bug_counts = quality_bug_counts_by_version(rows)
+    compare_version_bug_counts = quality_bug_counts_by_version(compare_rows)
+    listed_versions = set(version_bug_counts)
+    compare_listed_versions = set(compare_version_bug_counts)
+    rate_target_versions = listed_versions | compare_listed_versions
+    category_rate_total_a = sum(
+        compare_version_total_counts.get(version, 0)
+        for version in rate_target_versions
+    )
+    category_rate_total_b = sum(
+        version_total_counts.get(version, 0)
+        for version in rate_target_versions
+    )
     category_color_indexes = {
         str(item["category"]): index % 8
         for index, item in enumerate(chart_rows)
     }
     max_count = max(1, *(item["count"] for item in chart_rows))
+    quarter_periods = recent_fiscal_quarter_periods(date.today())
+    quality_project_id_query = {"project_id": project_id}
+    selected_project_ids = resolve_project_ids(project_id)
+    selected_project_id_set = set(selected_project_ids)
+    available_project_name_by_id = {
+        str(project.get("id") or "").strip(): str(project.get("name") or project.get("id") or "").strip()
+        for project in available_projects or []
+        if str(project.get("id") or "").strip()
+    }
+    project_options: list[dict[str, str]] = []
+    seen_project_ids: set[str] = set()
+    for selected_project_id in selected_project_ids:
+        project_options.append(
+            {
+                "id": selected_project_id,
+                "name": available_project_name_by_id.get(selected_project_id) or selected_project_id,
+            }
+        )
+        seen_project_ids.add(selected_project_id)
+    for project in available_projects or []:
+        option_id = str(project.get("id") or "").strip()
+        if not option_id or option_id in seen_project_ids:
+            continue
+        project_options.append(
+            {
+                "id": option_id,
+                "name": str(project.get("name") or option_id),
+            }
+        )
+        seen_project_ids.add(option_id)
+    project_checkboxes_html = "\n".join(
+        f"""
+            <label class="quality-project-option">
+              <input type="checkbox" class="quality-project-checkbox" value="{escape_text(project["id"])}"{' checked' if project["id"] in selected_project_id_set else ''}>
+              <span>{escape_text(project["name"])}</span>
+              <code>{escape_text(project["id"])}</code>
+            </label>"""
+        for project in project_options
+    )
+    project_selector_html = f"""
+        <fieldset class="quality-project-field">
+          <legend>PROJECT_ID</legend>
+          <input type="hidden" id="quality-project-id-input" name="project_id" value="{escape_text(project_id)}">
+          <div class="quality-project-options">
+{project_checkboxes_html}
+          </div>
+        </fieldset>"""
     quarter_links_html = "\n".join(
         f"""
-          <a class="preset-link" href="/{QUALITY_HTML}?{urlencode({'from': start.isoformat(), 'to': end.isoformat(), 'basis': date_basis})}">{escape_text(label)} <span>{escape_text(start.isoformat())} - {escape_text(end.isoformat())}</span></a>"""
-        for label, start, end in fiscal_quarter_periods(date.today())
+          <a class="preset-link" href="/{QUALITY_HTML}?{urlencode({**quality_project_id_query, 'from': start.isoformat(), 'to': end.isoformat(), 'basis': date_basis})}">{escape_text(label)} <span>{escape_text(start.isoformat())} - {escape_text(end.isoformat())}</span></a>"""
+        for label, start, end in quarter_periods[:6]
+    )
+    compare_preset_links_html = "\n".join(
+        f"""
+          <a class="preset-link" href="/{QUALITY_HTML}?{urlencode({**quality_project_id_query, 'compare': '1', 'a_from': previous_start.isoformat(), 'a_to': previous_end.isoformat(), 'from': current_start.isoformat(), 'to': current_end.isoformat(), 'basis': date_basis})}">{escape_text(previous_label)} vs {escape_text(current_label)} <span>{escape_text(previous_start.isoformat())} - {escape_text(current_end.isoformat())}</span></a>"""
+        for (current_label, current_start, current_end), (previous_label, previous_start, previous_end)
+        in zip(quarter_periods, quarter_periods[1:])
     )
 
     def render_quality_bar_row(index: int, item: dict[str, Any]) -> str:
@@ -4281,28 +4562,359 @@ def render_quality_html(
     primary_date_label = "作成日" if date_basis == "created" else "更新日"
     secondary_date_label = "更新日" if date_basis == "created" else "作成日"
 
-    table_rows = "\n".join(
-        f"""
+    def render_issue_table_rows(issue_rows: list[dict[str, Any]]) -> str:
+        rendered_rows = "\n".join(
+            f"""
           <tr class="{row_quality_color_class(row).strip()}">
-            <td>{escape_text(row[primary_date_key])}</td>
-            <td>{escape_text(row[secondary_date_key])}</td>
+            <td class="quality-date-cell">{escape_text(row[primary_date_key])}</td>
+            <td class="quality-date-cell">{escape_text(row[secondary_date_key])}</td>
             <td class="issue-cell">
               <a href="{escape_text(row["url"])}" target="_blank" rel="noopener noreferrer">#{escape_text(row["id"])}</a>
               <span>{escape_text(row["subject"])}</span>
             </td>
-            <td>{escape_text(row["category_text"])}</td>
+            <td class="quality-category-cell">{escape_text(row["category_text"])}</td>
             <td>{escape_text(row["tracker"])}</td>
             <td>{escape_text(row["status"])}</td>
             <td>{escape_text(row["assignee"])}</td>
             <td>{escape_text(row["version"])}</td>
           </tr>"""
-        for row in rows
-    )
-    if not table_rows:
-        table_rows = """
+            for row in issue_rows
+        )
+        if rendered_rows:
+            return rendered_rows
+        return """
           <tr>
             <td colspan="8" class="empty-message">対象チケットはありません。</td>
           </tr>"""
+
+    compare_counts_a = quality_count_map(compare_rows)
+    compare_counts_b = quality_count_map(period_b_rows)
+    compare_categories = sorted(
+        set(compare_counts_a) | set(compare_counts_b),
+        key=lambda category: (-compare_counts_b.get(category, 0), -compare_counts_a.get(category, 0), category),
+    )
+    compare_color_indexes = {
+        category: index % 8
+        for index, category in enumerate(["全体", *compare_categories])
+    }
+    category_color_indexes.update(compare_color_indexes)
+    table_rows = render_issue_table_rows(rows)
+    compare_table_rows = render_issue_table_rows(compare_rows)
+    compare_max_count = max(1, len(compare_rows), len(period_b_rows), *compare_counts_a.values(), *compare_counts_b.values())
+
+    def compare_metric(count_a: int, count_b: int, total_a: int | None = None, total_b: int | None = None) -> str:
+        delta = count_b - count_a
+        sign_delta = f"{delta:+d}件"
+        count_delta_text = f"件数 {quality_delta_rate_text(count_a, count_b)}"
+        rate_a = quality_rate_value(count_a, total_a) if total_a is not None else None
+        rate_b = quality_rate_value(count_b, total_b) if total_b is not None else None
+        rate_delta = None if rate_a is None or rate_b is None else rate_b - rate_a
+        rate_delta_html = ""
+        if total_a is not None and total_b is not None:
+            rate_delta_html = f"""
+            <span class="quality-rate quality-delta-rate {quality_delta_class(rate_delta or 0)}">率差 {escape_text(quality_rate_point_delta_text(rate_a, rate_b))}</span>"""
+        return f"""
+            <strong class="quality-delta quality-delta-count {quality_delta_class(delta)}">{escape_text(sign_delta)}</strong>
+            <span class="quality-rate quality-delta-percent {quality_delta_class(delta)}">{escape_text(count_delta_text)}</span>{rate_delta_html}"""
+
+    def render_compare_row(category: str, count_a: int, count_b: int, is_total: bool = False) -> str:
+        color_class = f" quality-bar-color-{compare_color_indexes.get(category, 0)}"
+        total_class = " is-total" if is_total else ""
+        width_a = count_a / compare_max_count * 100
+        width_b = count_b / compare_max_count * 100
+        return f"""
+        <div class="quality-compare-row{total_class}{color_class}">
+          <span class="quality-compare-name">{escape_text(category)}</span>
+          <span class="quality-compare-bars">
+            <span class="quality-compare-line"><b>期間A</b><i><span style="width: {width_a:.2f}%"></span></i><strong>{count_a}/{category_rate_total_a}件</strong></span>
+            <span class="quality-compare-line"><b>期間B</b><i><span style="width: {width_b:.2f}%"></span></i><strong>{count_b}/{category_rate_total_b}件</strong></span>
+          </span>
+          <span class="quality-compare-delta">{compare_metric(count_a, count_b, category_rate_total_a, category_rate_total_b)}</span>
+        </div>"""
+
+    compare_chart_html = "\n".join(
+        [
+            render_compare_row("全体", len(compare_rows), len(period_b_rows), True),
+            *[
+                render_compare_row(
+                    category,
+                    compare_counts_a.get(category, 0),
+                    compare_counts_b.get(category, 0),
+                )
+                for category in compare_categories
+            ],
+        ]
+    ) or '<p class="empty-message">対象チケットはありません。</p>'
+
+    def render_version_rate_row(version: str) -> str:
+        total_count = version_total_counts.get(version, 0)
+        bug_count = version_bug_counts.get(version, 0)
+        return f"""
+          <tr>
+            <th scope="row">{escape_text(version)}</th>
+            <td>{total_count}件</td>
+            <td>{bug_count}件</td>
+            <td><strong>{escape_text(quality_rate_text(bug_count, total_count))}</strong></td>
+          </tr>"""
+
+    version_rate_versions = sorted(
+        listed_versions,
+        key=lambda version: (-version_bug_counts.get(version, 0), -version_total_counts.get(version, 0), version),
+    )
+    version_rate_total_count = sum(version_total_counts.get(version, 0) for version in version_rate_versions)
+    version_rate_bug_count = sum(version_bug_counts.get(version, 0) for version in version_rate_versions)
+    version_rate_total_row_html = f"""
+          <tr class="is-summary">
+            <th scope="row">対象バージョン合計</th>
+            <td>{version_rate_total_count}件</td>
+            <td>{version_rate_bug_count}件</td>
+            <td><strong>{escape_text(quality_rate_text(version_rate_bug_count, version_rate_total_count))}</strong></td>
+          </tr>""" if version_rate_versions else ""
+    version_rate_rows_html = "\n".join(
+        [version_rate_total_row_html, *[render_version_rate_row(version) for version in version_rate_versions]]
+    ) or """
+          <tr>
+            <td colspan="4" class="empty-message">対象チケットはありません。</td>
+          </tr>"""
+
+    def render_compare_version_rate_row(version: str) -> str:
+        total_a = compare_version_total_counts.get(version, 0)
+        bug_a = compare_version_bug_counts.get(version, 0)
+        total_b = version_total_counts.get(version, 0)
+        bug_b = version_bug_counts.get(version, 0)
+        delta = bug_b - bug_a
+        rate_a = quality_rate_value(bug_a, total_a)
+        rate_b = quality_rate_value(bug_b, total_b)
+        rate_delta = None if rate_a is None or rate_b is None else rate_b - rate_a
+        return f"""
+          <tr>
+            <th scope="row">{escape_text(version)}</th>
+            <td>{total_a}件</td>
+            <td>{bug_a}件</td>
+            <td><strong>{escape_text(quality_rate_text(bug_a, total_a))}</strong></td>
+            <td>{total_b}件</td>
+            <td>{bug_b}件</td>
+            <td><strong>{escape_text(quality_rate_text(bug_b, total_b))}</strong></td>
+            <td><strong class="quality-delta {quality_delta_class(delta)}">{delta:+d}件</strong></td>
+            <td><strong class="quality-delta {quality_delta_class(rate_delta or 0)}">{escape_text(quality_rate_point_delta_text(rate_a, rate_b))}</strong></td>
+          </tr>"""
+
+    compare_version_rate_versions = sorted(
+        compare_listed_versions | listed_versions,
+        key=lambda version: (
+            -version_bug_counts.get(version, 0),
+            -compare_version_bug_counts.get(version, 0),
+            -version_total_counts.get(version, 0),
+            version,
+        ),
+    )
+    compare_version_total_a = sum(compare_version_total_counts.get(version, 0) for version in compare_version_rate_versions)
+    compare_version_bug_a = sum(compare_version_bug_counts.get(version, 0) for version in compare_version_rate_versions)
+    compare_version_total_b = sum(version_total_counts.get(version, 0) for version in compare_version_rate_versions)
+    compare_version_bug_b = sum(version_bug_counts.get(version, 0) for version in compare_version_rate_versions)
+    compare_rate_a = quality_rate_value(compare_version_bug_a, compare_version_total_a)
+    compare_rate_b = quality_rate_value(compare_version_bug_b, compare_version_total_b)
+    compare_rate_delta = None if compare_rate_a is None or compare_rate_b is None else compare_rate_b - compare_rate_a
+    compare_version_total_row_html = f"""
+          <tr class="is-summary">
+            <th scope="row">対象バージョン合計</th>
+            <td>{compare_version_total_a}件</td>
+            <td>{compare_version_bug_a}件</td>
+            <td><strong>{escape_text(quality_rate_text(compare_version_bug_a, compare_version_total_a))}</strong></td>
+            <td>{compare_version_total_b}件</td>
+            <td>{compare_version_bug_b}件</td>
+            <td><strong>{escape_text(quality_rate_text(compare_version_bug_b, compare_version_total_b))}</strong></td>
+            <td><strong class="quality-delta {quality_delta_class(compare_version_bug_b - compare_version_bug_a)}">{compare_version_bug_b - compare_version_bug_a:+d}件</strong></td>
+            <td><strong class="quality-delta {quality_delta_class(compare_rate_delta or 0)}">{escape_text(quality_rate_point_delta_text(compare_rate_a, compare_rate_b))}</strong></td>
+          </tr>""" if compare_version_rate_versions else ""
+    compare_version_rate_rows_html = "\n".join(
+        [
+            compare_version_total_row_html,
+            *[render_compare_version_rate_row(version) for version in compare_version_rate_versions],
+        ]
+    ) or """
+          <tr>
+            <td colspan="9" class="empty-message">対象チケットはありません。</td>
+          </tr>"""
+    version_rate_section_html = f"""
+    <section class="panel">
+      <div class="section-heading">
+        <h2>対象バージョン別 不具合率</h2>
+      </div>
+      <div class="table-wrap">
+        <table class="quality-rate-table">
+          <thead>
+            <tr>
+              <th scope="col">対象バージョン</th>
+              <th scope="col">総件数</th>
+              <th scope="col">不具合件数</th>
+              <th scope="col">不具合率</th>
+            </tr>
+          </thead>
+          <tbody>
+{version_rate_rows_html}
+          </tbody>
+        </table>
+      </div>
+    </section>"""
+    active_view_query = {
+        **quality_project_id_query,
+        "from": date_from.isoformat(),
+        "to": date_to.isoformat(),
+        "basis": date_basis,
+    }
+    compare_view_query = {
+        **quality_project_id_query,
+        "compare": "1",
+        "a_from": period_a_from.isoformat(),
+        "a_to": period_a_to.isoformat(),
+        "from": date_from.isoformat(),
+        "to": date_to.isoformat(),
+        "basis": date_basis,
+    }
+    mode_switch_html = f"""
+        <div class="mode-switch" aria-label="表示モード">
+          <a class="mode-link{' is-active' if not compare_mode else ''}" href="/{QUALITY_HTML}?{urlencode(active_view_query)}">単一区間</a>
+          <a class="mode-link{' is-active' if compare_mode else ''}" href="/{QUALITY_HTML}?{urlencode(compare_view_query)}">2期間比較</a>
+        </div>"""
+    compare_fields_html = f"""
+{project_selector_html}
+        <input type="hidden" name="compare" value="1">
+        <label>
+          <span>期間A 開始日</span>
+          <input type="date" name="a_from" value="{escape_text(period_a_from.isoformat())}">
+        </label>
+        <label>
+          <span>期間A 終了日</span>
+          <input type="date" name="a_to" value="{escape_text(period_a_to.isoformat())}">
+        </label>
+        <label>
+          <span>期間B 開始日</span>
+          <input type="date" name="from" value="{escape_text(date_from.isoformat())}">
+        </label>
+        <label>
+          <span>期間B 終了日</span>
+          <input type="date" name="to" value="{escape_text(date_to.isoformat())}">
+        </label>"""
+    single_fields_html = f"""
+{project_selector_html}
+        <label>
+          <span>開始日</span>
+          <input type="date" name="from" value="{escape_text(date_from.isoformat())}">
+        </label>
+        <label>
+          <span>終了日</span>
+          <input type="date" name="to" value="{escape_text(date_to.isoformat())}">
+        </label>"""
+    period_fields_html = compare_fields_html if compare_mode else single_fields_html
+    preset_links_html = compare_preset_links_html if compare_mode else quarter_links_html
+    preset_label = "四半期比較プリセット" if compare_mode else "四半期プリセット"
+    summary_html = f"""
+      <div class="summary" aria-label="品質改善サマリー">
+        <article class="summary-card">
+          <span>対象チケット</span>
+          <strong>{len(rows)}</strong>
+        </article>
+        <article class="summary-card">
+          <span>カテゴリ数</span>
+          <strong>{len(category_counts)}</strong>
+        </article>
+        <article class="summary-card">
+          <span>対象期間</span>
+          <strong>{escape_text(date_from.isoformat())} - {escape_text(date_to.isoformat())}</strong>
+        </article>
+      </div>"""
+    if compare_mode:
+        delta = len(period_b_rows) - len(compare_rows)
+        summary_html = f"""
+      <div class="summary compare-summary" aria-label="品質改善比較サマリー">
+        <article class="summary-card">
+          <span>期間A</span>
+          <strong>{len(compare_rows)}</strong>
+          <em>{escape_text(period_a_from.isoformat())} - {escape_text(period_a_to.isoformat())}</em>
+        </article>
+        <article class="summary-card">
+          <span>期間B</span>
+          <strong>{len(period_b_rows)}</strong>
+          <em>{escape_text(date_from.isoformat())} - {escape_text(date_to.isoformat())}</em>
+        </article>
+        <article class="summary-card">
+          <span>増減</span>
+          <strong class="quality-delta {quality_delta_class(delta)}">{delta:+d}件</strong>
+          <em>{escape_text(quality_delta_rate_text(len(compare_rows), len(period_b_rows)))}</em>
+        </article>
+      </div>"""
+    chart_section_html = f"""
+    <section class="panel quality-bars" aria-label="カテゴリ別件数">
+{chart_html}
+    </section>"""
+
+    def render_quality_table_section(title: str, rows_html: str) -> str:
+        heading_html = f"""
+      <div class="section-heading">
+        <h2>{escape_text(title)}</h2>
+      </div>""" if title else ""
+        return f"""
+    <section class="panel">
+{heading_html}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">{primary_date_label}</th>
+              <th scope="col">{secondary_date_label}</th>
+              <th scope="col">Issue</th>
+              <th scope="col">不具合のカテゴリ</th>
+              <th scope="col">トラッカー</th>
+              <th scope="col">ステータス</th>
+              <th scope="col">担当者</th>
+              <th scope="col">対象バージョン</th>
+            </tr>
+          </thead>
+          <tbody>
+{rows_html}
+          </tbody>
+        </table>
+      </div>
+    </section>"""
+
+    issue_tables_html = render_quality_table_section("", table_rows)
+    if compare_mode:
+        chart_section_html = f"""
+    <section class="panel quality-compare" aria-label="カテゴリ別件数比較">
+{compare_chart_html}
+    </section>"""
+        version_rate_section_html = f"""
+    <section class="panel">
+      <div class="section-heading">
+        <h2>対象バージョン別 不具合率</h2>
+      </div>
+      <div class="table-wrap">
+        <table class="quality-rate-table">
+          <thead>
+            <tr>
+              <th scope="col">対象バージョン</th>
+              <th scope="col">A 総件数</th>
+              <th scope="col">A 不具合</th>
+              <th scope="col">A 不具合率</th>
+              <th scope="col">B 総件数</th>
+              <th scope="col">B 不具合</th>
+              <th scope="col">B 不具合率</th>
+              <th scope="col">不具合増減</th>
+              <th scope="col">不具合率差</th>
+            </tr>
+          </thead>
+          <tbody>
+{compare_version_rate_rows_html}
+          </tbody>
+        </table>
+      </div>
+    </section>"""
+        issue_tables_html = f"""
+    <div class="compare-ticket-grid">
+{render_quality_table_section("期間Aのチケット一覧", compare_table_rows)}
+{render_quality_table_section("期間Bのチケット一覧", table_rows)}
+    </div>"""
 
     return f"""<!doctype html>
 <html lang="ja" data-theme="system">
@@ -4468,6 +5080,32 @@ def render_quality_html(
       padding: 14px;
     }}
 
+    .mode-switch {{
+      display: inline-flex;
+      gap: 4px;
+      padding: 14px 14px 0;
+    }}
+
+    .mode-link {{
+      display: inline-flex;
+      min-height: 32px;
+      align-items: center;
+      padding: 6px 10px;
+      color: var(--control-text);
+      background: var(--row-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 800;
+      text-decoration: none;
+    }}
+
+    .mode-link.is-active {{
+      color: var(--button-text);
+      background: var(--button-bg);
+      border-color: var(--button-bg);
+    }}
+
     .preset-links {{
       display: flex;
       flex-wrap: wrap;
@@ -4547,6 +5185,56 @@ def render_quality_html(
       white-space: nowrap;
     }}
 
+    .quality-project-field {{
+      min-width: min(100%, 520px);
+      margin: 0;
+      padding: 9px;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+    }}
+
+    .quality-project-field legend {{
+      padding: 0 4px;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .quality-project-options {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      max-height: 120px;
+      overflow: auto;
+    }}
+
+    .quality-project-option {{
+      display: inline-flex;
+      max-width: 320px;
+      min-height: 32px;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 8px;
+      color: var(--control-text);
+      background: var(--row-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      white-space: nowrap;
+    }}
+
+    .quality-project-option span,
+    .quality-project-option code {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+
+    .quality-project-option code {{
+      color: var(--muted-text);
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 800;
+    }}
+
     .summary {{
       display: grid;
       grid-template-columns: repeat(3, minmax(130px, 1fr));
@@ -4572,6 +5260,30 @@ def render_quality_html(
       display: block;
       margin-top: 6px;
       font-size: 22px;
+    }}
+
+    .summary-card em {{
+      display: block;
+      margin-top: 4px;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-style: normal;
+      font-weight: 800;
+    }}
+
+    .quality-delta.is-increase,
+    .quality-rate.is-increase {{
+      color: #f97316;
+    }}
+
+    .quality-delta.is-decrease,
+    .quality-rate.is-decrease {{
+      color: #22c55e;
+    }}
+
+    .quality-delta.is-flat,
+    .quality-rate.is-flat {{
+      color: var(--muted-text);
     }}
 
     .quality-bars {{
@@ -4739,6 +5451,122 @@ def render_quality_html(
       --quality-bar-fill: #2dd4bf;
     }}
 
+    .quality-compare {{
+      display: grid;
+      gap: 8px;
+      padding: 14px;
+    }}
+
+    .quality-compare-row {{
+      display: grid;
+      grid-template-columns: minmax(130px, 220px) minmax(360px, 1fr) minmax(330px, auto);
+      gap: 12px;
+      align-items: center;
+      padding-bottom: 8px;
+      border-bottom: 1px solid color-mix(in srgb, var(--panel-border) 70%, transparent);
+      --quality-bar-bg: var(--bar-bg);
+      --quality-bar-fill: var(--bar-fill);
+    }}
+
+    .quality-compare-row:last-child {{
+      padding-bottom: 0;
+      border-bottom: 0;
+    }}
+
+    .quality-compare-row.is-total {{
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--panel-border);
+      font-weight: 900;
+    }}
+
+    .quality-compare-name {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 900;
+    }}
+
+    .quality-compare-bars {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 12px;
+      min-width: 0;
+    }}
+
+    .quality-compare-line {{
+      display: grid;
+      grid-template-columns: 46px minmax(0, 1fr) 72px;
+      gap: 8px;
+      align-items: center;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .quality-compare-line b {{
+      color: var(--text-color);
+      font-size: 11px;
+      white-space: nowrap;
+    }}
+
+    .quality-compare-line i {{
+      display: block;
+      height: 10px;
+      overflow: hidden;
+      background: var(--quality-bar-bg);
+      border-radius: 999px;
+      font-style: normal;
+    }}
+
+    .quality-compare-line i span {{
+      display: block;
+      min-width: 2px;
+      height: 100%;
+      background: var(--quality-bar-fill);
+      border-radius: inherit;
+    }}
+
+    .quality-compare-delta {{
+      display: grid;
+      grid-template-columns: 48px 112px 86px;
+      justify-content: end;
+      gap: 10px;
+      align-items: baseline;
+      font-size: 12px;
+      font-weight: 900;
+      white-space: nowrap;
+    }}
+
+    .quality-compare-delta > * {{
+      text-align: right;
+    }}
+
+    .quality-rate {{
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
+    .section-heading {{
+      padding: 12px 12px 0;
+    }}
+
+    .section-heading h2 {{
+      margin: 0;
+      font-size: 15px;
+    }}
+
+    .compare-ticket-grid {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+    }}
+
+    .compare-ticket-grid .panel {{
+      min-width: 0;
+    }}
+
     .table-wrap {{
       overflow: auto;
     }}
@@ -4747,6 +5575,19 @@ def render_quality_html(
       width: 100%;
       min-width: 980px;
       border-collapse: collapse;
+    }}
+
+    .quality-rate-table {{
+      min-width: 920px;
+    }}
+
+    .quality-rate-table .is-summary {{
+      background: var(--row-bg);
+      font-weight: 900;
+    }}
+
+    .compare-ticket-grid table {{
+      min-width: 1120px;
     }}
 
     th,
@@ -4775,17 +5616,37 @@ def render_quality_html(
       display: flex;
       gap: 8px;
       align-items: baseline;
-      min-width: 260px;
+      min-width: 360px;
+      white-space: nowrap;
+    }}
+
+    .quality-date-cell {{
+      width: 92px;
+      min-width: 92px;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
     }}
 
     .issue-cell a {{
       flex: 0 0 auto;
-      color: var(--quality-bar-fill, var(--link-color));
     }}
 
     .issue-cell span {{
-      overflow-wrap: anywhere;
       font-weight: 700;
+    }}
+
+    .quality-category-cell {{
+      color: var(--quality-bar-fill, var(--text-color));
+      font-weight: 900;
+      white-space: nowrap;
+    }}
+
+    .compare-ticket-grid td {{
+      white-space: nowrap;
+    }}
+
+    .compare-ticket-grid .issue-cell {{
+      white-space: nowrap;
     }}
 
     .empty-message {{
@@ -4801,8 +5662,22 @@ def render_quality_html(
       }}
 
       .summary,
-      .quality-bar-row {{
+      .quality-bar-row,
+      .quality-compare-row {{
         grid-template-columns: 1fr;
+      }}
+
+      .compare-ticket-grid {{
+        grid-template-columns: 1fr;
+      }}
+
+      .quality-compare-bars {{
+        grid-template-columns: 1fr;
+      }}
+
+      .quality-compare-delta {{
+        grid-template-columns: repeat(3, auto);
+        justify-content: flex-start;
       }}
     }}
   </style>
@@ -4817,15 +5692,9 @@ def render_quality_html(
   </header>
   <main>
     <section class="panel">
+{mode_switch_html}
       <form class="filters" action="/{QUALITY_HTML}" method="get">
-        <label>
-          <span>開始日</span>
-          <input type="date" name="from" value="{escape_text(date_from.isoformat())}">
-        </label>
-        <label>
-          <span>終了日</span>
-          <input type="date" name="to" value="{escape_text(date_to.isoformat())}">
-        </label>
+{period_fields_html}
         <fieldset class="date-basis-filter">
           <legend>日付基準</legend>
           <div class="date-basis-options">
@@ -4841,51 +5710,19 @@ def render_quality_html(
         </fieldset>
         <button class="button" type="submit">表示</button>
       </form>
-      <div class="preset-links" aria-label="四半期プリセット">
-{quarter_links_html}
+      <div class="preset-links" aria-label="{preset_label}">
+{preset_links_html}
       </div>
-      <div class="summary" aria-label="品質改善サマリー">
-        <article class="summary-card">
-          <span>対象チケット</span>
-          <strong>{len(rows)}</strong>
-        </article>
-        <article class="summary-card">
-          <span>カテゴリ数</span>
-          <strong>{len(category_counts)}</strong>
-        </article>
-        <article class="summary-card">
-          <span>対象期間</span>
-          <strong>{escape_text(date_from.isoformat())} - {escape_text(date_to.isoformat())}</strong>
-        </article>
-      </div>
+{summary_html}
     </section>
-    <section class="panel quality-bars" aria-label="カテゴリ別件数">
-{chart_html}
-    </section>
-    <section class="panel">
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th scope="col">{primary_date_label}</th>
-              <th scope="col">{secondary_date_label}</th>
-              <th scope="col">Issue</th>
-              <th scope="col">不具合のカテゴリ</th>
-              <th scope="col">トラッカー</th>
-              <th scope="col">ステータス</th>
-              <th scope="col">担当者</th>
-              <th scope="col">対象バージョン</th>
-            </tr>
-          </thead>
-          <tbody>
-{table_rows}
-          </tbody>
-        </table>
-      </div>
-    </section>
+{chart_section_html}
+{version_rate_section_html}
+{issue_tables_html}
   </main>
   <script>
     const THEME_STORAGE_KEY = "redmine-kanban-theme";
+    const qualityProjectInput = document.getElementById("quality-project-id-input");
+    const qualityProjectCheckboxes = Array.from(document.querySelectorAll(".quality-project-checkbox"));
     function getSavedTheme() {{
       const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
       return ["light", "dark", "system"].includes(savedTheme) ? savedTheme : "system";
@@ -4899,6 +5736,21 @@ def render_quality_html(
         applyTheme(getSavedTheme());
       }}
     }});
+    function updateQualityProjectInput() {{
+      if (!qualityProjectInput) {{
+        return;
+      }}
+      const selectedProjectIds = qualityProjectCheckboxes
+        .filter((checkbox) => checkbox.checked)
+        .map((checkbox) => checkbox.value);
+      if (selectedProjectIds.length > 0) {{
+        qualityProjectInput.value = selectedProjectIds.join(", ");
+      }}
+    }}
+    qualityProjectCheckboxes.forEach((checkbox) => {{
+      checkbox.addEventListener("change", updateQualityProjectInput);
+    }});
+    updateQualityProjectInput();
   </script>
 </body>
 </html>
@@ -5378,10 +6230,10 @@ def render_kanban_html(
 
     .project-control {{
       display: grid;
-      grid-template-columns: minmax(0, 1fr) repeat(7, auto);
+      grid-template-columns: minmax(220px, 340px) repeat(7, auto);
       align-items: end;
       gap: 8px;
-      max-width: 1100px;
+      max-width: 1280px;
       margin-top: 12px;
     }}
 
@@ -6906,6 +7758,25 @@ def resolve_project_id(project_id_override: str | None = None) -> str:
     return project_id or DEFAULT_PROJECT_ID
 
 
+def split_project_ids(project_id_value: str | None) -> list[str]:
+    raw_value = project_id_value if project_id_value is not None else os.getenv("PROJECT_ID")
+    raw_value = raw_value or DEFAULT_PROJECT_ID
+    project_ids = [
+        project_id.strip()
+        for project_id in re.split(r"[,;\s]+", raw_value)
+        if project_id.strip()
+    ]
+    return project_ids or [DEFAULT_PROJECT_ID]
+
+
+def resolve_project_ids(project_id_override: str | None = None) -> list[str]:
+    return [resolve_project_id(project_id) for project_id in split_project_ids(project_id_override)]
+
+
+def project_ids_label(project_ids: list[str]) -> str:
+    return ", ".join(project_ids)
+
+
 def load_issue_data(
     project_id_override: str | None = None,
     updated_since: date | None = None,
@@ -7309,7 +8180,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
 
         query = parse_qs(parsed_url.query)
         query_project_id = request_project_id(query)
-        if query_project_id:
+        if query_project_id and response_path != QUALITY_HTML:
             resolved_project_id = resolve_project_id(query_project_id)
             self.send_response(303)
             self.send_header("Location", f"/{response_path}")
@@ -7342,6 +8213,23 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                 with ISSUE_CACHE_LOCK:
                     cached_entry = ISSUE_CACHE.get(resolved_project_id)
                     cached_issues = list(cached_entry.issues) if cached_entry else []
+                worktime_issue_ids = {
+                    issue_id
+                    for entry in entries
+                    if (issue_id := time_entry_issue_id(entry)) != "-"
+                }
+                cached_issue_ids = {
+                    str(issue.get("id"))
+                    for issue in cached_issues
+                    if issue.get("id") not in (None, "")
+                }
+                missing_issues = [
+                    issue
+                    for issue_id in sorted(worktime_issue_ids - cached_issue_ids)
+                    if (issue := fetch_issue(redmine_url, api_key, issue_id)) is not None
+                ]
+                if missing_issues:
+                    cached_issues.extend(missing_issues)
                 response_body = render_worktime_html(
                     entries,
                     redmine_url,
@@ -7350,6 +8238,112 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                     date_to,
                     issue_fixed_version_map(cached_issues),
                     issue_subject_map(cached_issues),
+                )
+                status_code = 200
+                encoded_body = response_body.encode("utf-8")
+                self.send_response(status_code)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded_body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(encoded_body)
+                return
+
+            if response_path == QUALITY_HTML:
+                quality_project_ids = resolve_project_ids(query_project_id or project_id)
+                quality_project_label = project_ids_label(quality_project_ids)
+
+                for quality_project_id in quality_project_ids:
+                    ensure_issue_cache_loaded_from_disk(quality_project_id)
+
+                with ISSUE_CACHE_LOCK:
+                    missing_project_ids = [
+                        quality_project_id
+                        for quality_project_id in quality_project_ids
+                        if quality_project_id not in ISSUE_CACHE
+                    ]
+                    refresh_errors = {
+                        quality_project_id: ISSUE_REFRESH_ERRORS.get(quality_project_id)
+                        for quality_project_id in quality_project_ids
+                        if ISSUE_REFRESH_ERRORS.get(quality_project_id)
+                    }
+
+                if missing_project_ids:
+                    first_missing_project_id = missing_project_ids[0]
+                    if first_missing_project_id in refresh_errors:
+                        response_body = render_error_html(refresh_errors[first_missing_project_id])
+                        status_code = 500
+                    else:
+                        for missing_project_id in missing_project_ids:
+                            if missing_project_id not in refresh_errors:
+                                start_background_refresh(missing_project_id)
+                        response_body = render_loading_html(
+                            quality_project_label,
+                            f"{response_path}?{parsed_url.query}",
+                        )
+                        status_code = 200
+                    encoded_body = response_body.encode("utf-8")
+                    self.send_response(status_code)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(encoded_body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(encoded_body)
+                    return
+
+                today = date.today()
+                date_from = parse_worktime_date(query.get("from", [None])[0], add_months(today, -3))
+                date_to = parse_worktime_date(query.get("to", [None])[0], today)
+                if date_from > date_to:
+                    date_from, date_to = date_to, date_from
+                compare_mode = query.get("compare", ["0"])[0] == "1"
+                period_length = (date_to - date_from).days + 1
+                compare_to = parse_worktime_date(query.get("a_to", [None])[0], date_from - timedelta(days=1))
+                compare_from = parse_worktime_date(
+                    query.get("a_from", [None])[0],
+                    compare_to - timedelta(days=max(0, period_length - 1)),
+                )
+                if compare_from > compare_to:
+                    compare_from, compare_to = compare_to, compare_from
+                date_basis = query.get("basis", ["created"])[0]
+                if date_basis not in {"updated", "created"}:
+                    date_basis = "created"
+
+                quality_issues: list[dict[str, Any]] = []
+                redmine_url = ""
+                for quality_project_id in quality_project_ids:
+                    loaded_redmine_url, resolved_quality_project_id, _, _ = load_cached_issue_data(quality_project_id)
+                    redmine_url = redmine_url or loaded_redmine_url
+                    start_background_refresh(
+                        resolved_quality_project_id,
+                        refresh_mode="incremental",
+                        once_per_startup=True,
+                    )
+                    with ISSUE_CACHE_LOCK:
+                        cached_entry = ISSUE_CACHE.get(resolved_quality_project_id)
+                        if cached_entry:
+                            quality_issues.extend(cached_entry.issues)
+
+                load_env()
+                api_key = os.getenv("REDMINE_API_KEY")
+                category_labels = (
+                    fetch_custom_field_value_labels(redmine_url, api_key, BUG_CATEGORY_FIELD_NAME)
+                    if api_key and redmine_url
+                    else {}
+                )
+                available_projects = fetch_projects(redmine_url, api_key) if api_key and redmine_url else []
+                response_body = render_quality_html(
+                    quality_issues,
+                    redmine_url,
+                    quality_project_label,
+                    date_from,
+                    date_to,
+                    category_labels,
+                    date_basis,
+                    compare_mode,
+                    compare_from,
+                    compare_to,
+                    available_projects,
                 )
                 status_code = 200
                 encoded_body = response_body.encode("utf-8")
@@ -7406,9 +8400,18 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                 date_to = parse_worktime_date(query.get("to", [None])[0], today)
                 if date_from > date_to:
                     date_from, date_to = date_to, date_from
-                date_basis = query.get("basis", ["updated"])[0]
+                compare_mode = query.get("compare", ["0"])[0] == "1"
+                period_length = (date_to - date_from).days + 1
+                compare_to = parse_worktime_date(query.get("a_to", [None])[0], date_from - timedelta(days=1))
+                compare_from = parse_worktime_date(
+                    query.get("a_from", [None])[0],
+                    compare_to - timedelta(days=max(0, period_length - 1)),
+                )
+                if compare_from > compare_to:
+                    compare_from, compare_to = compare_to, compare_from
+                date_basis = query.get("basis", ["created"])[0]
                 if date_basis not in {"updated", "created"}:
-                    date_basis = "updated"
+                    date_basis = "created"
                 with ISSUE_CACHE_LOCK:
                     cached_entry = ISSUE_CACHE.get(resolved_project_id)
                     quality_issues = list(cached_entry.issues) if cached_entry else visible_issues
@@ -7419,6 +8422,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                     if api_key
                     else {}
                 )
+                available_projects = fetch_projects(redmine_url, api_key) if api_key else []
                 response_body = render_quality_html(
                     quality_issues,
                     redmine_url,
@@ -7427,6 +8431,10 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                     date_to,
                     category_labels,
                     date_basis,
+                    compare_mode,
+                    compare_from,
+                    compare_to,
+                    available_projects,
                 )
             elif response_path == COMBINED_HTML:
                 response_body = render_combined_html(resolved_project_id)
