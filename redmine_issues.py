@@ -4244,6 +4244,10 @@ def render_quality_html(
     rows = quality_issue_rows(issues, redmine_url, date_from, date_to, category_labels, date_basis)
     category_counts = quality_category_counts(rows)
     chart_rows = [{"category": "全体", "count": len(rows), "is_total": True}, *category_counts]
+    category_color_indexes = {
+        str(item["category"]): index % 8
+        for index, item in enumerate(chart_rows)
+    }
     max_count = max(1, *(item["count"] for item in chart_rows))
     quarter_links_html = "\n".join(
         f"""
@@ -4251,22 +4255,37 @@ def render_quality_html(
         for label, start, end in fiscal_quarter_periods(date.today())
     )
 
-    chart_html = "\n".join(
-        f"""
-        <div class="quality-bar-row{' is-total' if item.get('is_total') else ''}">
+    def render_quality_bar_row(index: int, item: dict[str, Any]) -> str:
+        color_class = f" quality-bar-color-{index % 8}"
+        total_class = " is-total" if item.get("is_total") else ""
+        width = item["count"] / max_count * 100
+        return f"""
+        <div class="quality-bar-row{total_class}{color_class}">
           <span class="quality-bar-name">{escape_text(item["category"])}</span>
-          <span class="quality-bar-track"><span style="width: {item["count"] / max_count * 100:.2f}%"></span></span>
+          <span class="quality-bar-track"><span style="width: {width:.2f}%"></span></span>
           <strong>{item["count"]}件</strong>
         </div>"""
-        for item in chart_rows
+
+    chart_html = "\n".join(
+        render_quality_bar_row(index, item)
+        for index, item in enumerate(chart_rows)
     ) or '<p class="empty-message">対象チケットはありません。</p>'
+
+    def row_quality_color_class(row: dict[str, Any]) -> str:
+        categories = row.get("categories") or []
+        color_index = category_color_indexes.get(categories[0]) if categories else None
+        return f" quality-bar-color-{color_index}" if color_index is not None else ""
+
+    primary_date_key = "created_date" if date_basis == "created" else "updated_date"
+    secondary_date_key = "updated_date" if date_basis == "created" else "created_date"
+    primary_date_label = "作成日" if date_basis == "created" else "更新日"
+    secondary_date_label = "更新日" if date_basis == "created" else "作成日"
 
     table_rows = "\n".join(
         f"""
-          <tr>
-            <td>{escape_text(row["date"].isoformat())}</td>
-            <td>{escape_text(row["created_date"])}</td>
-            <td>{escape_text(row["updated_date"])}</td>
+          <tr class="{row_quality_color_class(row).strip()}">
+            <td>{escape_text(row[primary_date_key])}</td>
+            <td>{escape_text(row[secondary_date_key])}</td>
             <td class="issue-cell">
               <a href="{escape_text(row["url"])}" target="_blank" rel="noopener noreferrer">#{escape_text(row["id"])}</a>
               <span>{escape_text(row["subject"])}</span>
@@ -4282,7 +4301,7 @@ def render_quality_html(
     if not table_rows:
         table_rows = """
           <tr>
-            <td colspan="7" class="empty-message">対象チケットはありません。</td>
+            <td colspan="8" class="empty-message">対象チケットはありません。</td>
           </tr>"""
 
     return f"""<!doctype html>
@@ -4568,6 +4587,8 @@ def render_quality_html(
       align-items: center;
       font-size: 13px;
       font-weight: 800;
+      --quality-bar-bg: var(--bar-bg);
+      --quality-bar-fill: var(--bar-fill);
     }}
 
     .quality-bar-row.is-total {{
@@ -4584,7 +4605,7 @@ def render_quality_html(
     .quality-bar-track {{
       height: 18px;
       overflow: hidden;
-      background: var(--bar-bg);
+      background: var(--quality-bar-bg);
       border-radius: 999px;
     }}
 
@@ -4592,8 +4613,130 @@ def render_quality_html(
       display: block;
       min-width: 2px;
       height: 100%;
-      background: var(--bar-fill);
+      background: var(--quality-bar-fill);
       border-radius: inherit;
+    }}
+
+    .quality-bar-color-0 {{
+      --quality-bar-bg: #fee2e2;
+      --quality-bar-fill: #fb7185;
+    }}
+
+    .quality-bar-color-1 {{
+      --quality-bar-bg: #ffedd5;
+      --quality-bar-fill: #f97316;
+    }}
+
+    .quality-bar-color-2 {{
+      --quality-bar-bg: #fef9c3;
+      --quality-bar-fill: #eab308;
+    }}
+
+    .quality-bar-color-3 {{
+      --quality-bar-bg: #dcfce7;
+      --quality-bar-fill: #22c55e;
+    }}
+
+    .quality-bar-color-4 {{
+      --quality-bar-bg: #dbeafe;
+      --quality-bar-fill: #3b82f6;
+    }}
+
+    .quality-bar-color-5 {{
+      --quality-bar-bg: #e0e7ff;
+      --quality-bar-fill: #6366f1;
+    }}
+
+    .quality-bar-color-6 {{
+      --quality-bar-bg: #f3e8ff;
+      --quality-bar-fill: #a855f7;
+    }}
+
+    .quality-bar-color-7 {{
+      --quality-bar-bg: #ccfbf1;
+      --quality-bar-fill: #14b8a6;
+    }}
+
+    @media (prefers-color-scheme: dark) {{
+      :root:not([data-theme="light"]) .quality-bar-color-0 {{
+        --quality-bar-bg: #4c1d2a;
+        --quality-bar-fill: #fb7185;
+      }}
+
+      :root:not([data-theme="light"]) .quality-bar-color-1 {{
+        --quality-bar-bg: #431f0b;
+        --quality-bar-fill: #fb923c;
+      }}
+
+      :root:not([data-theme="light"]) .quality-bar-color-2 {{
+        --quality-bar-bg: #3f3209;
+        --quality-bar-fill: #facc15;
+      }}
+
+      :root:not([data-theme="light"]) .quality-bar-color-3 {{
+        --quality-bar-bg: #12331f;
+        --quality-bar-fill: #4ade80;
+      }}
+
+      :root:not([data-theme="light"]) .quality-bar-color-4 {{
+        --quality-bar-bg: #172554;
+        --quality-bar-fill: #60a5fa;
+      }}
+
+      :root:not([data-theme="light"]) .quality-bar-color-5 {{
+        --quality-bar-bg: #25245a;
+        --quality-bar-fill: #818cf8;
+      }}
+
+      :root:not([data-theme="light"]) .quality-bar-color-6 {{
+        --quality-bar-bg: #32174d;
+        --quality-bar-fill: #c084fc;
+      }}
+
+      :root:not([data-theme="light"]) .quality-bar-color-7 {{
+        --quality-bar-bg: #123c38;
+        --quality-bar-fill: #2dd4bf;
+      }}
+    }}
+
+    html[data-theme="dark"] .quality-bar-color-0 {{
+      --quality-bar-bg: #4c1d2a;
+      --quality-bar-fill: #fb7185;
+    }}
+
+    html[data-theme="dark"] .quality-bar-color-1 {{
+      --quality-bar-bg: #431f0b;
+      --quality-bar-fill: #fb923c;
+    }}
+
+    html[data-theme="dark"] .quality-bar-color-2 {{
+      --quality-bar-bg: #3f3209;
+      --quality-bar-fill: #facc15;
+    }}
+
+    html[data-theme="dark"] .quality-bar-color-3 {{
+      --quality-bar-bg: #12331f;
+      --quality-bar-fill: #4ade80;
+    }}
+
+    html[data-theme="dark"] .quality-bar-color-4 {{
+      --quality-bar-bg: #172554;
+      --quality-bar-fill: #60a5fa;
+    }}
+
+    html[data-theme="dark"] .quality-bar-color-5 {{
+      --quality-bar-bg: #25245a;
+      --quality-bar-fill: #818cf8;
+    }}
+
+    html[data-theme="dark"] .quality-bar-color-6 {{
+      --quality-bar-bg: #32174d;
+      --quality-bar-fill: #c084fc;
+    }}
+
+    html[data-theme="dark"] .quality-bar-color-7 {{
+      --quality-bar-bg: #123c38;
+      --quality-bar-fill: #2dd4bf;
     }}
 
     .table-wrap {{
@@ -4637,6 +4780,7 @@ def render_quality_html(
 
     .issue-cell a {{
       flex: 0 0 auto;
+      color: var(--quality-bar-fill, var(--link-color));
     }}
 
     .issue-cell span {{
@@ -4683,7 +4827,7 @@ def render_quality_html(
           <input type="date" name="to" value="{escape_text(date_to.isoformat())}">
         </label>
         <fieldset class="date-basis-filter">
-          <legend>対象日付</legend>
+          <legend>日付基準</legend>
           <div class="date-basis-options">
             <label>
               <input type="radio" name="basis" value="updated"{' checked' if date_basis == 'updated' else ''}>
@@ -4723,9 +4867,8 @@ def render_quality_html(
         <table>
           <thead>
             <tr>
-              <th scope="col">対象日付</th>
-              <th scope="col">作成日</th>
-              <th scope="col">更新日</th>
+              <th scope="col">{primary_date_label}</th>
+              <th scope="col">{secondary_date_label}</th>
               <th scope="col">Issue</th>
               <th scope="col">不具合のカテゴリ</th>
               <th scope="col">トラッカー</th>
