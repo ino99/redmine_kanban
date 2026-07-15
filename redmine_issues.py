@@ -3,6 +3,8 @@
 
 import html
 import hashlib
+import csv
+import io
 import json
 import os
 import re
@@ -36,11 +38,14 @@ SUB_ASSIGNEE_FIELD_NAME = "副担当者"
 SUB_ASSIGNEE_CACHE_FIELD = "_sub_assignees"
 BALL_POSSESSION_FIELD_NAME = "ボール所持"
 BUG_CATEGORY_FIELD_NAME = "不具合のカテゴリ"
+PRODUCTION_INCIDENT_FIELD_NAME = "\u672c\u756a\u969c\u5bb3"
+CONTAMINATION_VERSION_FIELD_NAME = "\u6df7\u5165\u30d0\u30fc\u30b8\u30e7\u30f3"
 OUTPUT_HTML = "kanban.html"
 WORKLOAD_HTML = "workload.html"
 COMBINED_HTML = "combined.html"
 WORKTIME_HTML = "worktime.html"
 QUALITY_HTML = "quality.html"
+QUALITY_VERSION_HTML = "quality_versions.html"
 CACHE_DIR = Path(".cache")
 CACHE_SCHEMA_VERSION = 1
 DEFAULT_SERVE_HOST = "127.0.0.1"
@@ -318,6 +323,24 @@ def ball_possession_values(issue: dict[str, Any]) -> list[str]:
 def bug_category_values(issue: dict[str, Any]) -> list[str]:
     values = custom_field_values(issue, BUG_CATEGORY_FIELD_NAME)
     return values or ["未設定"]
+
+
+def is_production_incident(issue: dict[str, Any]) -> bool:
+    """Return whether the issue's production-incident field is set to yes."""
+    affirmative_values = {"はい", "yes", "true", "1"}
+    return any(
+        value.strip().casefold() in affirmative_values
+        for value in custom_field_values(issue, PRODUCTION_INCIDENT_FIELD_NAME)
+    )
+
+
+def contamination_version_names(
+    issue: dict[str, Any],
+    labels: dict[str, str] | None = None,
+) -> list[str]:
+    labels = labels or {}
+    values = custom_field_values(issue, CONTAMINATION_VERSION_FIELD_NAME)
+    return [labels.get(value, value) for value in values] or ["未設定"]
 
 
 def format_remaining_work_time(value: str) -> str:
@@ -707,6 +730,92 @@ def fetch_custom_field_value_labels(
             continue
         return possible_value_label_map(field.get("possible_values"))
     return {}
+
+
+def fetch_custom_field_value_order(
+    redmine_url: str,
+    api_key: str,
+    field_name: str,
+) -> list[str]:
+    endpoint = urljoin(redmine_url.rstrip("/") + "/", "custom_fields.json")
+    request = Request(endpoint, headers={"X-Redmine-API-Key": api_key})
+    try:
+        with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            data = json.load(response)
+    except (HTTPError, TimeoutError, URLError, json.JSONDecodeError):
+        return []
+
+    custom_fields = data.get("custom_fields") if isinstance(data, dict) else None
+    if not isinstance(custom_fields, list):
+        return []
+    for field in custom_fields:
+        if not isinstance(field, dict) or str(field.get("name") or "") != field_name:
+            continue
+        possible_values = field.get("possible_values")
+        if not isinstance(possible_values, list):
+            return []
+        ordered_names: list[str] = []
+        for item in possible_values:
+            if isinstance(item, dict):
+                label = item.get("label") or item.get("name") or item.get("value")
+            else:
+                label = item
+            if label not in (None, "") and str(label) not in ordered_names:
+                ordered_names.append(str(label))
+        return ordered_names
+    return []
+
+
+def fetch_project_versions(
+    redmine_url: str,
+    api_key: str,
+    project_id: str,
+) -> list[dict[str, Any]]:
+    endpoint = urljoin(
+        redmine_url.rstrip("/") + "/",
+        f"projects/{project_id}/versions.json",
+    )
+    request = Request(endpoint, headers={"X-Redmine-API-Key": api_key})
+    try:
+        with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            data = json.load(response)
+    except (HTTPError, TimeoutError, URLError, json.JSONDecodeError):
+        return []
+
+    versions = data.get("versions") if isinstance(data, dict) else None
+    if not isinstance(versions, list):
+        return []
+    return [
+        version
+        for version in versions
+        if isinstance(version, dict)
+        and version.get("id") not in (None, "")
+        and version.get("name") not in (None, "")
+    ]
+
+
+def fetch_project_version_labels(
+    redmine_url: str,
+    api_key: str,
+    project_id: str,
+) -> dict[str, str]:
+    return {
+        str(version.get("id")): str(version.get("name"))
+        for version in fetch_project_versions(redmine_url, api_key, project_id)
+    }
+
+
+def version_labels_from_issues(issues: list[dict[str, Any]]) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for issue in issues:
+        fixed_version = issue.get("fixed_version")
+        if not isinstance(fixed_version, dict):
+            continue
+        version_id = fixed_version.get("id")
+        version_name = fixed_version.get("name")
+        if version_id not in (None, "") and version_name not in (None, ""):
+            labels[str(version_id)] = str(version_name)
+    return labels
 
 
 def fetch_user_name(redmine_url: str, api_key: str, user_id: str) -> str | None:
@@ -2895,6 +3004,17 @@ def issue_subject_map(issues: list[dict[str, Any]]) -> dict[str, str]:
     return subjects
 
 
+def issue_remaining_work_map(issues: list[dict[str, Any]]) -> dict[str, str]:
+    remaining: dict[str, str] = {}
+    for issue in issues:
+        issue_id = issue.get("id")
+        if issue_id in (None, ""):
+            continue
+        value = remaining_work_time(issue)
+        remaining[str(issue_id)] = format_remaining_work_time(value) if value != "-" else "-"
+    return remaining
+
+
 def render_worktime_html(
     entries: list[dict[str, Any]],
     redmine_url: str,
@@ -2903,9 +3023,11 @@ def render_worktime_html(
     date_to: date,
     issue_versions: dict[str, str] | None = None,
     issue_subjects: dict[str, str] | None = None,
+    issue_remaining: dict[str, str] | None = None,
 ) -> str:
     issue_versions = issue_versions or {}
     issue_subjects = issue_subjects or {}
+    issue_remaining = issue_remaining or {}
     users = sorted({time_entry_user_name(entry) for entry in entries if time_entry_user_name(entry) != "-"})
     user_options = ['<option value="__all__">全員</option>']
     user_options.extend(
@@ -2928,6 +3050,7 @@ def render_worktime_html(
                 "activity": time_entry_activity(entry),
                 "hours": time_entry_hours_value(entry),
                 "comment": time_entry_comment(entry),
+                "remaining_work": issue_remaining.get(issue_id, "-"),
             }
         )
     worktime_version_names = {item["version"] for item in worktime_entries if item["version"]}
@@ -3684,6 +3807,7 @@ def render_worktime_html(
               <th scope="col">活動</th>
               <th scope="col">時間</th>
               <th scope="col">コメント</th>
+              <th scope="col">残作業時間</th>
             </tr>
           </thead>
           <tbody id="worktime-body"></tbody>
@@ -4187,6 +4311,7 @@ def render_worktime_html(
         }}
         appendCell(row, formatHours(Number(entry.hours || 0)), "hours");
         appendCell(row, entry.comment || "", "comment");
+        appendCell(row, entry.remaining_work || "-");
         body.append(row);
       }});
     }}
@@ -4251,10 +4376,13 @@ def quality_issue_rows(
     date_to: date,
     category_labels: dict[str, str] | None = None,
     date_basis: str = "created",
+    contamination_labels: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     category_labels = category_labels or {}
     rows: list[dict[str, Any]] = []
     for issue in issues:
+        if not is_production_incident(issue):
+            continue
         if not has_custom_field(issue, BUG_CATEGORY_FIELD_NAME):
             continue
         issue_date = issue_quality_date(issue, date_basis)
@@ -4269,6 +4397,7 @@ def quality_issue_rows(
         categories = [category for category in categories if category != "未設定"]
         if not categories:
             continue
+        contamination_versions = contamination_version_names(issue, contamination_labels)
         rows.append(
             {
                 "date": issue_date,
@@ -4280,9 +4409,11 @@ def quality_issue_rows(
                 "tracker": issue_field(issue, "tracker"),
                 "status": issue_field(issue, "status"),
                 "assignee": assignee_name(issue),
-                "version": fixed_version_name(issue),
+                "version": ", ".join(contamination_versions),
+                "target_version": fixed_version_name(issue),
                 "categories": categories,
                 "category_text": ", ".join(categories),
+                "contamination_version": ", ".join(contamination_versions),
             }
         )
     return sorted(rows, key=lambda item: (item["date"], item["id"]), reverse=True)
@@ -4360,9 +4491,6 @@ def quality_count_map(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 def quality_issue_total_counts_by_version(
     issues: list[dict[str, Any]],
-    date_from: date,
-    date_to: date,
-    date_basis: str,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
     seen_issue_ids: set[Any] = set()
@@ -4371,9 +4499,8 @@ def quality_issue_total_counts_by_version(
         if issue_id in seen_issue_ids:
             continue
         seen_issue_ids.add(issue_id)
-        issue_date = issue_quality_date(issue, date_basis)
-        if issue_date is None or issue_date < date_from or issue_date > date_to:
-            continue
+        # The denominator is development volume for the same target version,
+        # regardless of the selected defect-reporting period.
         version = fixed_version_name(issue)
         counts[version] = counts.get(version, 0) + 1
     return counts
@@ -4387,7 +4514,7 @@ def quality_bug_counts_by_version(rows: list[dict[str, Any]]) -> dict[str, int]:
         if issue_id in seen_issue_ids:
             continue
         seen_issue_ids.add(issue_id)
-        version = str(row.get("version") or "未設定")
+        version = str(row.get("contamination_version") or "未設定")
         counts[version] = counts.get(version, 0) + 1
     return counts
 
@@ -4424,6 +4551,340 @@ def quality_delta_class(delta: int) -> str:
     return "is-flat"
 
 
+def version_sort_key(version: str) -> tuple[int, tuple[int, ...]]:
+    if version == "未設定":
+        return (0, ())
+    special_match = re.search(r"(?<!\d)(\d{2})/(\d{1,2})(?!\d)", version)
+    if special_match:
+        return (1, (3, int(special_match.group(1)), int(special_match.group(2))) )
+    match = re.search(r"(?<!\d)[vV]?(\d+(?:\.\d+)+)", version)
+    if not match:
+        return (0, ())
+    suffix = 1 if "hotfix" in version.casefold() else 0
+    return (1, tuple(int(part) for part in match.group(1).split(".")) + (suffix,))
+
+
+def normalized_version_name(version: str) -> str:
+    return re.sub(r"\s+", " ", str(version or "").strip()).casefold()
+
+
+def render_quality_version_csv(
+    issues: list[dict[str, Any]],
+    redmine_url: str,
+    project_id: str,
+    category_labels: dict[str, str] | None = None,
+    contamination_labels: dict[str, str] | None = None,
+    selected_versions: list[str] | None = None,
+    export_type: str = "detail",
+) -> str:
+    category_labels = category_labels or {}
+    contamination_labels = contamination_labels or {}
+    rows = quality_issue_rows(
+        issues,
+        redmine_url,
+        date.min,
+        date.max,
+        category_labels,
+        "created",
+        contamination_labels,
+    )
+    bug_counts = quality_bug_counts_by_version(rows)
+    total_counts = quality_issue_total_counts_by_version(issues)
+    available_versions = set(total_counts) | set(bug_counts)
+    active_versions = [
+        version for version in selected_versions or [] if version in available_versions
+    ] or sorted(available_versions, key=version_sort_key, reverse=True)
+    active_version_set = set(active_versions)
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\r\n")
+    if export_type == "summary":
+        writer.writerow(["混入バージョン", "開発チケット総数", "不具合件数", "不具合率"])
+        for version in active_versions:
+            total_count = total_counts.get(version, 0)
+            bug_count = bug_counts.get(version, 0)
+            writer.writerow(
+                [
+                    version,
+                    total_count,
+                    bug_count,
+                    quality_rate_value(bug_count, total_count),
+                ]
+            )
+    else:
+        writer.writerow(
+            [
+                "PROJECT_ID",
+                "Issue_ID",
+                "題名",
+                "作成日",
+                "更新日",
+                "対象バージョン",
+                "混入バージョン",
+                "不具合カテゴリ",
+                "本番障害",
+                "トラッカー",
+                "ステータス",
+                "担当者",
+            ]
+        )
+        for row in rows:
+            if str(row.get("contamination_version") or "未設定") not in active_version_set:
+                continue
+            writer.writerow(
+                [
+                    project_id,
+                    row["id"],
+                    row["subject"],
+                    row["created_date"],
+                    row["updated_date"],
+                    row["target_version"],
+                    row["contamination_version"],
+                    row["category_text"],
+                    "はい",
+                    row["tracker"],
+                    row["status"],
+                    row["assignee"],
+                ]
+            )
+    return output.getvalue()
+
+
+def render_quality_version_html(
+    issues: list[dict[str, Any]],
+    redmine_url: str,
+    project_id: str,
+    category_labels: dict[str, str] | None = None,
+    contamination_labels: dict[str, str] | None = None,
+    selected_versions: list[str] | None = None,
+    sort_mode: str = "rate",
+    version_order: list[str] | None = None,
+) -> str:
+    category_labels = category_labels or {}
+    contamination_labels = contamination_labels or {}
+    rows = quality_issue_rows(
+        issues,
+        redmine_url,
+        date.min,
+        date.max,
+        category_labels,
+        "created",
+        contamination_labels,
+    )
+    bug_counts = quality_bug_counts_by_version(rows)
+    total_counts = quality_issue_total_counts_by_version(issues)
+    available_versions = sorted(
+        set(total_counts) | set(bug_counts),
+        key=lambda version: (-bug_counts.get(version, 0), version),
+    )
+    requested_versions = [version for version in selected_versions or [] if version in available_versions]
+    active_versions = requested_versions or list(available_versions)
+    sort_mode = sort_mode if sort_mode in {"rate", "version"} else "rate"
+    if sort_mode == "version":
+        active_versions.sort(key=version_sort_key, reverse=True)
+    else:
+        active_versions.sort(
+            key=lambda version: (
+                total_counts.get(version, 0) > 0,
+                quality_rate_value(bug_counts.get(version, 0), total_counts.get(version, 0)) or 0,
+                bug_counts.get(version, 0),
+            ),
+            reverse=True,
+        )
+    active_version_set = set(active_versions)
+    total_count = sum(total_counts.get(version, 0) for version in active_versions)
+    bug_count = sum(bug_counts.get(version, 0) for version in active_versions)
+    rate = quality_rate_text(bug_count, total_count)
+
+    version_options_html = "\n".join(
+        f"""
+          <label class="version-option">
+            <input type="checkbox" name="version" value="{escape_text(version)}" data-bug-count="{bug_counts.get(version, 0)}"{' checked' if version in active_version_set else ''}>
+            <span>{escape_text(version)}</span>
+          </label>"""
+        for version in available_versions
+    ) or '<p class="empty-message">対象バージョンがありません。</p>'
+
+    def render_rate_row(version: str) -> str:
+        version_total = total_counts.get(version, 0)
+        version_bug = bug_counts.get(version, 0)
+        version_rate = quality_rate_value(version_bug, version_total) or 0
+        return f"""
+        <div class="version-rate-row">
+          <strong>{escape_text(version)}</strong>
+          <span class="version-rate-track"><i style="width: {min(100, version_rate):.2f}%"></i></span>
+          <span>{version_bug}件 / {version_total}件</span>
+          <b>{escape_text(quality_rate_text(version_bug, version_total))}</b>
+        </div>"""
+
+    rate_rows_html = "\n".join(render_rate_row(version) for version in active_versions)
+    issue_rows = [
+        row
+        for row in rows
+        if str(row.get("contamination_version") or "未設定") in active_version_set
+    ]
+    issue_rows.sort(
+        key=lambda row: (
+            active_versions.index(str(row.get("contamination_version") or "未設定"))
+            if str(row.get("contamination_version") or "未設定") in active_version_set
+            else len(active_versions),
+        )
+    )
+    issue_rows_html = "\n".join(
+        f"""
+        <tr>
+          <td>{escape_text(row["created_date"])}</td>
+          <td>{escape_text(row["updated_date"])}</td>
+          <td><a href="{escape_text(row["url"])}" target="_blank" rel="noopener noreferrer">#{escape_text(row["id"])}</a> {escape_text(row["subject"])}</td>
+          <td>{escape_text(row["contamination_version"])}</td>
+          <td>{escape_text(row["target_version"])}</td>
+          <td>{escape_text(row["category_text"])}</td>
+          <td>{escape_text(row["tracker"])}</td>
+          <td>{escape_text(row["assignee"])}</td>
+        </tr>"""
+        for row in issue_rows
+    ) or '<tr><td colspan="8" class="empty-message">対象チケットはありません。</td></tr>'
+    export_query = urlencode(
+        {"project_id": project_id, "version": active_versions},
+        doseq=True,
+    )
+    detail_csv_url = f"/{QUALITY_VERSION_HTML}?export=detail&{export_query}"
+    summary_csv_url = f"/{QUALITY_VERSION_HTML}?export=summary&{export_query}"
+    project_query = urlencode({"project_id": project_id})
+    return f"""<!doctype html>
+<html lang="ja" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>品質改善・バージョン比較 - Redmine Kanban</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    :root {{ color-scheme: light; --bg: #f3f4f6; --text: #111827; --muted: #64748b; --panel: #ffffff; --border: #cbd5e1; --accent: #c2185b; --track: #e2e8f0; }}
+    [data-theme="dark"] {{ color-scheme: dark; --bg: #0f172a; --text: #e5e7eb; --muted: #94a3b8; --panel: #111827; --border: #334155; --accent: #fb7185; --track: #1e293b; }}
+    body {{ margin: 0; color: var(--text); background: var(--bg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    .page-header {{ display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--border); }}
+    h1 {{ margin: 0; font-size: 22px; }} h2 {{ margin: 0 0 12px; font-size: 16px; }} p {{ margin: 5px 0; color: var(--muted); font-size: 12px; }}
+    main {{ display: grid; gap: 14px; padding: 14px; }}
+    .panel {{ padding: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }}
+    .actions {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+    .button, button {{ display: inline-block; padding: 8px 12px; color: #fff; background: var(--accent); border: 0; border-radius: 6px; font-weight: 800; text-decoration: none; cursor: pointer; }}
+    .version-options {{ display: flex; flex-wrap: wrap; gap: 7px; max-height: 150px; overflow: auto; margin-bottom: 12px; }}
+    .version-option {{ display: inline-flex; gap: 6px; align-items: center; padding: 6px 9px; color: var(--text); background: var(--track); border-radius: 999px; font-size: 12px; font-weight: 800; }}
+    .sort-options {{ display: flex; flex-wrap: wrap; gap: 12px; margin: 0 0 12px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; }} .sort-options legend {{ padding: 0 4px; color: var(--muted); font-size: 12px; font-weight: 800; }} .sort-options label {{ font-size: 12px; font-weight: 800; }}
+    .summary {{ display: grid; grid-template-columns: repeat(3, minmax(140px, 1fr)); gap: 10px; margin-top: 12px; }}
+    .summary-card {{ padding: 12px; background: var(--track); border-radius: 7px; }} .summary-card span {{ display: block; color: var(--muted); font-size: 12px; font-weight: 800; }} .summary-card strong {{ display: block; margin-top: 6px; font-size: 22px; }}
+    .version-rate-list {{ display: grid; gap: 10px; }}
+    .version-rate-row {{ display: grid; grid-template-columns: minmax(150px, 250px) 1fr auto 80px; gap: 10px; align-items: center; font-size: 13px; }}
+    .version-rate-track {{ height: 18px; overflow: hidden; background: var(--track); border-radius: 999px; }} .version-rate-track i {{ display: block; height: 100%; background: var(--accent); border-radius: inherit; }}
+    .table-wrap {{ overflow: auto; }} table {{ width: 100%; min-width: 900px; border-collapse: collapse; }} th, td {{ padding: 9px 10px; border-bottom: 1px solid var(--border); text-align: left; font-size: 12px; white-space: nowrap; }} th {{ color: var(--muted); }} a {{ color: var(--accent); font-weight: 800; text-decoration: none; }} .empty-message {{ padding: 16px; color: var(--muted); text-align: center; }}
+    .quality-version-issue-table th[data-sort-type] {{ cursor: pointer; user-select: none; }}
+    .quality-version-issue-table th[data-sort-type]::after {{ content: "↕"; margin-left: 6px; opacity: .7; }}
+    .quality-version-issue-table th[aria-sort="ascending"]::after {{ content: "↑"; opacity: 1; }}
+    .quality-version-issue-table th[aria-sort="descending"]::after {{ content: "↓"; opacity: 1; }}
+    @media (max-width: 760px) {{ .summary, .version-rate-row {{ grid-template-columns: 1fr; }} .page-header {{ align-items: flex-start; flex-direction: column; }} }}
+  </style>
+</head>
+<body>
+  <header class="page-header">
+    <div><h1>品質改善・バージョン比較</h1><p>PROJECT_ID: {escape_text(project_id)} / 混入バージョン別の不具合発生率</p></div>
+    <div class="actions"><a class="button" href="{detail_csv_url}">明細CSV</a><a class="button" href="{summary_csv_url}">集計CSV</a><a class="button" href="/{QUALITY_HTML}?{project_query}">期間分析</a><a class="button" href="/{OUTPUT_HTML}">かんばん</a></div>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>比較する混入バージョン</h2>
+      <form method="get" action="/{QUALITY_VERSION_HTML}">
+        <input type="hidden" name="project_id" value="{escape_text(project_id)}">
+        <div class="version-options">{version_options_html}</div>
+        <fieldset class="sort-options">
+          <legend>並び順</legend>
+          <label><input type="radio" name="sort" value="rate"{' checked' if sort_mode == 'rate' else ''}> 不具合発生率が高い順</label>
+          <label><input type="radio" name="sort" value="version"{' checked' if sort_mode == 'version' else ''}> 対象バージョンが新しい順</label>
+        </fieldset>
+        <div class="actions">
+          <button type="button" id="select-all-versions">全選択</button>
+          <button type="button" id="clear-all-versions">全解除</button>
+          <button type="button" id="exclude-zero-versions">0件を除外</button>
+          <button type="submit">表示</button>
+        </div>
+      </form>
+      <div class="summary">
+        <article class="summary-card"><span>対象バージョン数</span><strong>{len(active_versions)}</strong></article>
+        <article class="summary-card"><span>不具合件数</span><strong>{bug_count}件</strong></article>
+        <article class="summary-card"><span>合算不具合率</span><strong>{escape_text(rate)}</strong></article>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>バージョン別 不具合発生率</h2>
+      <div class="version-rate-list">{rate_rows_html or '<p class="empty-message">比較対象がありません。</p>'}</div>
+      <p>棒の長さは不具合率です。表示は「不具合件数 / 対象バージョンの開発チケット総数」です。</p>
+    </section>
+    <section class="panel">
+      <h2>対象チケット一覧</h2>
+      <div class="table-wrap"><table class="quality-version-issue-table"><thead><tr><th data-sort-type="date" aria-sort="none">作成日</th><th data-sort-type="date" aria-sort="none">更新日</th><th data-sort-type="issue" aria-sort="none">Issue</th><th data-sort-type="text" aria-sort="none">混入バージョン</th><th data-sort-type="text" aria-sort="none">対象バージョン</th><th data-sort-type="text" aria-sort="none">不具合カテゴリ</th><th data-sort-type="text" aria-sort="none">トラッカー</th><th data-sort-type="text" aria-sort="none">担当者</th></tr></thead><tbody>{issue_rows_html}</tbody></table></div>
+    </section>
+  </main>
+  <script>
+    const key = "redmine-kanban-theme";
+    const saved = localStorage.getItem(key);
+    if (["light", "dark", "system"].includes(saved)) document.documentElement.dataset.theme = saved;
+    window.addEventListener("storage", (event) => {{ if (event.key === key) document.documentElement.dataset.theme = event.newValue || "system"; }});
+    document.getElementById("select-all-versions")?.addEventListener("click", () => {{
+      document.querySelectorAll("input[name='version']").forEach((checkbox) => {{
+        checkbox.checked = true;
+      }});
+    }});
+    document.getElementById("clear-all-versions")?.addEventListener("click", () => {{
+      document.querySelectorAll("input[name='version']").forEach((checkbox) => {{
+        checkbox.checked = false;
+      }});
+    }});
+    document.getElementById("exclude-zero-versions")?.addEventListener("click", () => {{
+      document.querySelectorAll("input[name='version']").forEach((checkbox) => {{
+        if (checkbox.dataset.bugCount === "0") checkbox.checked = false;
+      }});
+    }});
+    document.querySelectorAll(".quality-version-issue-table").forEach((table) => {{
+      const headers = Array.from(table.querySelectorAll("thead th[data-sort-type]"));
+      const body = table.querySelector("tbody");
+      if (!body) return;
+      let activeColumn = -1;
+      let direction = 1;
+      headers.forEach((header, column) => {{
+        header.addEventListener("click", () => {{
+          direction = activeColumn === column ? direction * -1 : 1;
+          activeColumn = column;
+          headers.forEach((item) => item.setAttribute("aria-sort", "none"));
+          header.setAttribute("aria-sort", direction === 1 ? "ascending" : "descending");
+          const type = header.dataset.sortType;
+          const rows = Array.from(body.querySelectorAll("tr"));
+          rows.sort((left, right) => {{
+            const leftText = (left.cells[column]?.textContent || "").trim();
+            const rightText = (right.cells[column]?.textContent || "").trim();
+            let leftValue = leftText;
+            let rightValue = rightText;
+            if (type === "date") {{
+              leftValue = leftText || "9999-99-99";
+              rightValue = rightText || "9999-99-99";
+            }} else if (type === "issue") {{
+              leftValue = Number((leftText.match(/\\d+/) || ["-1"])[0]);
+              rightValue = Number((rightText.match(/\\d+/) || ["-1"])[0]);
+            }} else {{
+              leftValue = leftText.toLocaleLowerCase("ja");
+              rightValue = rightText.toLocaleLowerCase("ja");
+            }}
+            if (leftValue < rightValue) return -1 * direction;
+            if (leftValue > rightValue) return 1 * direction;
+            return 0;
+          }});
+          rows.forEach((row) => body.appendChild(row));
+        }});
+      }});
+    }});
+  </script>
+</body>
+</html>
+"""
+
+
 def render_quality_html(
     issues: list[dict[str, Any]],
     redmine_url: str,
@@ -4436,11 +4897,14 @@ def render_quality_html(
     compare_from: date | None = None,
     compare_to: date | None = None,
     available_projects: list[dict[str, str]] | None = None,
+    contamination_labels: dict[str, str] | None = None,
 ) -> str:
     date_basis = "created" if date_basis == "created" else "updated"
     period_a_from = compare_from or date_from
     period_a_to = compare_to or date_to
-    rows = quality_issue_rows(issues, redmine_url, date_from, date_to, category_labels, date_basis)
+    rows = quality_issue_rows(
+        issues, redmine_url, date_from, date_to, category_labels, date_basis, contamination_labels
+    )
     compare_rows = quality_issue_rows(
         issues,
         redmine_url,
@@ -4448,16 +4912,16 @@ def render_quality_html(
         period_a_to,
         category_labels,
         date_basis,
+        contamination_labels,
     )
     period_b_rows = rows
     category_counts = quality_category_counts(rows)
     chart_rows = [{"category": "全体", "count": len(rows), "is_total": True}, *category_counts]
-    version_total_counts = quality_issue_total_counts_by_version(issues, date_from, date_to, date_basis)
+    version_total_counts = quality_issue_total_counts_by_version(
+        issues
+    )
     compare_version_total_counts = quality_issue_total_counts_by_version(
         issues,
-        period_a_from,
-        period_a_to,
-        date_basis,
     )
     version_bug_counts = quality_bug_counts_by_version(rows)
     compare_version_bug_counts = quality_bug_counts_by_version(compare_rows)
@@ -4665,7 +5129,7 @@ def render_quality_html(
     version_rate_bug_count = sum(version_bug_counts.get(version, 0) for version in version_rate_versions)
     version_rate_total_row_html = f"""
           <tr class="is-summary">
-            <th scope="row">対象バージョン合計</th>
+            <th scope="row">混入バージョン合計</th>
             <td>{version_rate_total_count}件</td>
             <td>{version_rate_bug_count}件</td>
             <td><strong>{escape_text(quality_rate_text(version_rate_bug_count, version_rate_total_count))}</strong></td>
@@ -4717,7 +5181,7 @@ def render_quality_html(
     compare_rate_delta = None if compare_rate_a is None or compare_rate_b is None else compare_rate_b - compare_rate_a
     compare_version_total_row_html = f"""
           <tr class="is-summary">
-            <th scope="row">対象バージョン合計</th>
+            <th scope="row">混入バージョン合計</th>
             <td>{compare_version_total_a}件</td>
             <td>{compare_version_bug_a}件</td>
             <td><strong>{escape_text(quality_rate_text(compare_version_bug_a, compare_version_total_a))}</strong></td>
@@ -4739,13 +5203,13 @@ def render_quality_html(
     version_rate_section_html = f"""
     <section class="panel">
       <div class="section-heading">
-        <h2>対象バージョン別 不具合率</h2>
+        <h2>混入バージョン別 不具合発生率</h2>
       </div>
       <div class="table-wrap">
         <table class="quality-rate-table">
           <thead>
             <tr>
-              <th scope="col">対象バージョン</th>
+              <th scope="col">混入バージョン</th>
               <th scope="col">総件数</th>
               <th scope="col">不具合件数</th>
               <th scope="col">不具合率</th>
@@ -4778,7 +5242,6 @@ def render_quality_html(
           <a class="mode-link{' is-active' if compare_mode else ''}" href="/{QUALITY_HTML}?{urlencode(compare_view_query)}">2期間比較</a>
         </div>"""
     compare_fields_html = f"""
-{project_selector_html}
         <input type="hidden" name="compare" value="1">
         <label>
           <span>期間A 開始日</span>
@@ -4797,7 +5260,6 @@ def render_quality_html(
           <input type="date" name="to" value="{escape_text(date_to.isoformat())}">
         </label>"""
     single_fields_html = f"""
-{project_selector_html}
         <label>
           <span>開始日</span>
           <input type="date" name="from" value="{escape_text(date_from.isoformat())}">
@@ -4826,22 +5288,32 @@ def render_quality_html(
       </div>"""
     if compare_mode:
         delta = len(period_b_rows) - len(compare_rows)
+        summary_rate_a = quality_rate_value(len(compare_rows), category_rate_total_a)
+        summary_rate_b = quality_rate_value(len(period_b_rows), category_rate_total_b)
+        summary_rate_delta = (
+            None
+            if summary_rate_a is None or summary_rate_b is None
+            else summary_rate_b - summary_rate_a
+        )
         summary_html = f"""
       <div class="summary compare-summary" aria-label="品質改善比較サマリー">
         <article class="summary-card">
           <span>期間A</span>
           <strong>{len(compare_rows)}</strong>
           <em>{escape_text(period_a_from.isoformat())} - {escape_text(period_a_to.isoformat())}</em>
+          <small>不具合率 {escape_text(quality_rate_text(len(compare_rows), category_rate_total_a))}</small>
         </article>
         <article class="summary-card">
           <span>期間B</span>
           <strong>{len(period_b_rows)}</strong>
           <em>{escape_text(date_from.isoformat())} - {escape_text(date_to.isoformat())}</em>
+          <small>不具合率 {escape_text(quality_rate_text(len(period_b_rows), category_rate_total_b))}</small>
         </article>
         <article class="summary-card">
           <span>増減</span>
           <strong class="quality-delta {quality_delta_class(delta)}">{delta:+d}件</strong>
           <em>{escape_text(quality_delta_rate_text(len(compare_rows), len(period_b_rows)))}</em>
+          <small class="quality-delta {quality_delta_class(summary_rate_delta or 0)}">率差 {escape_text(quality_rate_point_delta_text(summary_rate_a, summary_rate_b))}</small>
         </article>
       </div>"""
     chart_section_html = f"""
@@ -4858,17 +5330,17 @@ def render_quality_html(
     <section class="panel">
 {heading_html}
       <div class="table-wrap">
-        <table>
+        <table class="quality-issue-table">
           <thead>
             <tr>
-              <th scope="col">{primary_date_label}</th>
-              <th scope="col">{secondary_date_label}</th>
-              <th scope="col">Issue</th>
-              <th scope="col">不具合のカテゴリ</th>
-              <th scope="col">トラッカー</th>
-              <th scope="col">ステータス</th>
-              <th scope="col">担当者</th>
-              <th scope="col">対象バージョン</th>
+              <th scope="col" data-sort-type="date" aria-sort="none">{primary_date_label}</th>
+              <th scope="col" data-sort-type="date" aria-sort="none">{secondary_date_label}</th>
+              <th scope="col" data-sort-type="issue" aria-sort="none">Issue</th>
+              <th scope="col" data-sort-type="text" aria-sort="none">不具合のカテゴリ</th>
+              <th scope="col" data-sort-type="text" aria-sort="none">トラッカー</th>
+              <th scope="col" data-sort-type="text" aria-sort="none">ステータス</th>
+              <th scope="col" data-sort-type="text" aria-sort="none">担当者</th>
+              <th scope="col" data-sort-type="text" aria-sort="none">混入バージョン</th>
             </tr>
           </thead>
           <tbody>
@@ -4887,13 +5359,13 @@ def render_quality_html(
         version_rate_section_html = f"""
     <section class="panel">
       <div class="section-heading">
-        <h2>対象バージョン別 不具合率</h2>
+        <h2>混入バージョン別 不具合発生率</h2>
       </div>
       <div class="table-wrap">
         <table class="quality-rate-table">
           <thead>
             <tr>
-              <th scope="col">対象バージョン</th>
+              <th scope="col">混入バージョン</th>
               <th scope="col">A 総件数</th>
               <th scope="col">A 不具合</th>
               <th scope="col">A 不具合率</th>
@@ -4921,7 +5393,7 @@ def render_quality_html(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>品質改善 - Redmine Kanban</title>
+  <title>品質改善・期間分析 - Redmine Kanban</title>
   <style>
     * {{
       box-sizing: border-box;
@@ -5271,6 +5743,14 @@ def render_quality_html(
       font-weight: 800;
     }}
 
+    .summary-card small {{
+      display: block;
+      margin-top: 4px;
+      color: var(--muted-text);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+
     .quality-delta.is-increase,
     .quality-rate.is-increase {{
       color: #f97316;
@@ -5606,6 +6086,29 @@ def render_quality_html(
       white-space: nowrap;
     }}
 
+    .quality-issue-table th[data-sort-type] {{
+      cursor: pointer;
+      user-select: none;
+    }}
+
+    .quality-issue-table th[data-sort-type]::after {{
+      content: "↕";
+      display: inline-block;
+      margin-left: 6px;
+      color: var(--muted-text);
+      opacity: .7;
+    }}
+
+    .quality-issue-table th[aria-sort="ascending"]::after {{
+      content: "↑";
+      opacity: 1;
+    }}
+
+    .quality-issue-table th[aria-sort="descending"]::after {{
+      content: "↓";
+      opacity: 1;
+    }}
+
     a {{
       color: var(--link-color);
       font-weight: 800;
@@ -5685,10 +6188,13 @@ def render_quality_html(
 <body>
   <header class="page-header">
     <div>
-      <h1>品質改善</h1>
+      <h1>品質改善・期間分析</h1>
       <p>PROJECT_ID: {escape_text(project_id)} / {escape_text(BUG_CATEGORY_FIELD_NAME)} 別の発生状況</p>
     </div>
-    <a class="button" href="/{OUTPUT_HTML}" target="_top">かんばん</a>
+    <div class="header-actions">
+      <a class="button" href="/{QUALITY_VERSION_HTML}" target="_top">バージョン比較</a>
+      <a class="button" href="/{OUTPUT_HTML}" target="_top">かんばん</a>
+    </div>
   </header>
   <main>
     <section class="panel">
@@ -5751,6 +6257,49 @@ def render_quality_html(
       checkbox.addEventListener("change", updateQualityProjectInput);
     }});
     updateQualityProjectInput();
+
+    document.querySelectorAll(".quality-issue-table").forEach((table) => {{
+      const headers = Array.from(table.querySelectorAll("thead th[data-sort-type]"));
+      const body = table.querySelector("tbody");
+      if (!body) {{
+        return;
+      }}
+      let activeColumn = -1;
+      let direction = 1;
+      headers.forEach((header) => {{
+        header.addEventListener("click", () => {{
+          const column = headers.indexOf(header);
+          direction = activeColumn === column ? direction * -1 : 1;
+          activeColumn = column;
+          headers.forEach((item) => item.setAttribute("aria-sort", "none"));
+          header.setAttribute("aria-sort", direction === 1 ? "ascending" : "descending");
+          const type = header.dataset.sortType;
+          const rows = Array.from(body.querySelectorAll("tr"));
+          const sortableRows = rows.filter((row) => row.cells.length > column);
+          const otherRows = rows.filter((row) => row.cells.length <= column);
+          sortableRows.sort((left, right) => {{
+            const leftText = (left.cells[column].textContent || "").trim();
+            const rightText = (right.cells[column].textContent || "").trim();
+            let leftValue = leftText;
+            let rightValue = rightText;
+            if (type === "date") {{
+              leftValue = leftText || "9999-99-99";
+              rightValue = rightText || "9999-99-99";
+            }} else if (type === "issue") {{
+              leftValue = Number((leftText.match(/\\d+/) || ["-1"])[0]);
+              rightValue = Number((rightText.match(/\\d+/) || ["-1"])[0]);
+            }} else {{
+              leftValue = leftText.toLocaleLowerCase("ja");
+              rightValue = rightText.toLocaleLowerCase("ja");
+            }}
+            if (leftValue < rightValue) return -1 * direction;
+            if (leftValue > rightValue) return 1 * direction;
+            return 0;
+          }});
+          [...sortableRows, ...otherRows].forEach((row) => body.appendChild(row));
+        }});
+      }});
+    }});
   </script>
 </body>
 </html>
@@ -8155,6 +8704,16 @@ def render_loading_html(project_id: str | None, reload_path: str = OUTPUT_HTML) 
 
 
 class KanbanRequestHandler(BaseHTTPRequestHandler):
+    def send_csv_response(self, body: str, filename: str) -> None:
+        encoded_body = body.encode("utf-8-sig")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded_body)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(encoded_body)
+
     def do_GET(self) -> None:
         parsed_url = urlparse(self.path)
         if parsed_url.path == "/.well-known/appspecific/com.chrome.devtools.json":
@@ -8163,7 +8722,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if parsed_url.path not in {"/", f"/{OUTPUT_HTML}", f"/{WORKLOAD_HTML}", f"/{COMBINED_HTML}", f"/{WORKTIME_HTML}", f"/{QUALITY_HTML}"}:
+        if parsed_url.path not in {"/", f"/{OUTPUT_HTML}", f"/{WORKLOAD_HTML}", f"/{COMBINED_HTML}", f"/{WORKTIME_HTML}", f"/{QUALITY_HTML}", f"/{QUALITY_VERSION_HTML}"}:
             self.send_error(404, "Not Found")
             return
 
@@ -8175,12 +8734,14 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
             response_path = WORKTIME_HTML
         elif parsed_url.path == f"/{QUALITY_HTML}":
             response_path = QUALITY_HTML
+        elif parsed_url.path == f"/{QUALITY_VERSION_HTML}":
+            response_path = QUALITY_VERSION_HTML
         else:
             response_path = OUTPUT_HTML
 
         query = parse_qs(parsed_url.query)
         query_project_id = request_project_id(query)
-        if query_project_id and response_path != QUALITY_HTML:
+        if query_project_id and response_path not in {QUALITY_HTML, QUALITY_VERSION_HTML}:
             resolved_project_id = resolve_project_id(query_project_id)
             self.send_response(303)
             self.send_header("Location", f"/{response_path}")
@@ -8238,6 +8799,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                     date_to,
                     issue_fixed_version_map(cached_issues),
                     issue_subject_map(cached_issues),
+                    issue_remaining_work_map(cached_issues),
                 )
                 status_code = 200
                 encoded_body = response_body.encode("utf-8")
@@ -8249,7 +8811,7 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(encoded_body)
                 return
 
-            if response_path == QUALITY_HTML:
+            if response_path in {QUALITY_HTML, QUALITY_VERSION_HTML}:
                 quality_project_ids = resolve_project_ids(query_project_id or project_id)
                 quality_project_label = project_ids_label(quality_project_ids)
 
@@ -8331,20 +8893,78 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                     if api_key and redmine_url
                     else {}
                 )
-                available_projects = fetch_projects(redmine_url, api_key) if api_key and redmine_url else []
-                response_body = render_quality_html(
-                    quality_issues,
-                    redmine_url,
-                    quality_project_label,
-                    date_from,
-                    date_to,
-                    category_labels,
-                    date_basis,
-                    compare_mode,
-                    compare_from,
-                    compare_to,
-                    available_projects,
+                contamination_labels = (
+                    fetch_custom_field_value_labels(
+                        redmine_url, api_key, CONTAMINATION_VERSION_FIELD_NAME
+                    )
+                    if api_key and redmine_url
+                    else {}
                 )
+                resolved_version_labels = version_labels_from_issues(quality_issues)
+                custom_field_order_names: list[str] = (
+                    fetch_custom_field_value_order(
+                        redmine_url, api_key, CONTAMINATION_VERSION_FIELD_NAME
+                    )
+                    if api_key and redmine_url
+                    else []
+                )
+                target_version_order_names: list[str] = []
+                if api_key and redmine_url:
+                    for quality_project_id in quality_project_ids:
+                        for version in fetch_project_versions(
+                            redmine_url, api_key, quality_project_id
+                        ):
+                            version_id = str(version.get("id") or "")
+                            version_name = str(version.get("name") or "")
+                            if version_id and version_name:
+                                resolved_version_labels[version_id] = version_name
+                            if version_name and version_name not in target_version_order_names:
+                                target_version_order_names.append(version_name)
+                resolved_version_labels.update(contamination_labels)
+                contamination_labels = resolved_version_labels
+                export_type = query.get("export", [""])[0]
+                if response_path == QUALITY_VERSION_HTML and export_type in {"detail", "summary"}:
+                    self.send_csv_response(
+                        render_quality_version_csv(
+                            quality_issues,
+                            redmine_url,
+                            quality_project_label,
+                            category_labels,
+                            contamination_labels,
+                            query.get("version", []),
+                            export_type,
+                        ),
+                        f"quality_version_{export_type}.csv",
+                    )
+                    return
+                version_order_names = target_version_order_names or custom_field_order_names
+                available_projects = fetch_projects(redmine_url, api_key) if api_key and redmine_url else []
+                if response_path == QUALITY_VERSION_HTML:
+                    response_body = render_quality_version_html(
+                        quality_issues,
+                        redmine_url,
+                        quality_project_label,
+                        category_labels,
+                        contamination_labels,
+                        query.get("version", []),
+                        query.get("sort", ["rate"])[0],
+                        version_order_names,
+                    )
+                else:
+                    response_body = render_quality_html(
+                        quality_issues,
+                        redmine_url,
+                        quality_project_label,
+                        date_from,
+                        date_to,
+                        category_labels,
+                        date_basis,
+                        compare_mode,
+                        compare_from,
+                        compare_to,
+                        available_projects,
+                        contamination_labels,
+                    )
                 status_code = 200
                 encoded_body = response_body.encode("utf-8")
                 self.send_response(status_code)
@@ -8422,20 +9042,77 @@ class KanbanRequestHandler(BaseHTTPRequestHandler):
                     if api_key
                     else {}
                 )
-                available_projects = fetch_projects(redmine_url, api_key) if api_key else []
-                response_body = render_quality_html(
-                    quality_issues,
-                    redmine_url,
-                    resolved_project_id,
-                    date_from,
-                    date_to,
-                    category_labels,
-                    date_basis,
-                    compare_mode,
-                    compare_from,
-                    compare_to,
-                    available_projects,
+                contamination_labels = (
+                    fetch_custom_field_value_labels(
+                        redmine_url, api_key, CONTAMINATION_VERSION_FIELD_NAME
+                    )
+                    if api_key
+                    else {}
                 )
+                resolved_version_labels = version_labels_from_issues(quality_issues)
+                custom_field_order_names = (
+                    fetch_custom_field_value_order(
+                        redmine_url, api_key, CONTAMINATION_VERSION_FIELD_NAME
+                    )
+                    if api_key
+                    else []
+                )
+                target_version_order_names = []
+                if api_key:
+                    for version in fetch_project_versions(
+                        redmine_url, api_key, resolved_project_id
+                    ):
+                        version_id = str(version.get("id") or "")
+                        version_name = str(version.get("name") or "")
+                        if version_id and version_name:
+                            resolved_version_labels[version_id] = version_name
+                        if version_name and version_name not in target_version_order_names:
+                            target_version_order_names.append(version_name)
+                resolved_version_labels.update(contamination_labels)
+                contamination_labels = resolved_version_labels
+                export_type = query.get("export", [""])[0]
+                if response_path == QUALITY_VERSION_HTML and export_type in {"detail", "summary"}:
+                    self.send_csv_response(
+                        render_quality_version_csv(
+                            quality_issues,
+                            redmine_url,
+                            resolved_project_id,
+                            category_labels,
+                            contamination_labels,
+                            query.get("version", []),
+                            export_type,
+                        ),
+                        f"quality_version_{export_type}.csv",
+                    )
+                    return
+                version_order_names = target_version_order_names or custom_field_order_names
+                available_projects = fetch_projects(redmine_url, api_key) if api_key else []
+                if response_path == QUALITY_VERSION_HTML:
+                    response_body = render_quality_version_html(
+                        quality_issues,
+                        redmine_url,
+                        resolved_project_id,
+                        category_labels,
+                        contamination_labels,
+                        query.get("version", []),
+                        query.get("sort", ["rate"])[0],
+                        version_order_names,
+                    )
+                else:
+                    response_body = render_quality_html(
+                        quality_issues,
+                        redmine_url,
+                        resolved_project_id,
+                        date_from,
+                        date_to,
+                        category_labels,
+                        date_basis,
+                        compare_mode,
+                        compare_from,
+                        compare_to,
+                        available_projects,
+                        contamination_labels,
+                    )
             elif response_path == COMBINED_HTML:
                 response_body = render_combined_html(resolved_project_id)
             else:
